@@ -8,3 +8,9 @@ dist/
 apps/extension/build/
 .DS_Store
 data/
+
+# compiled output never belongs beside sources
+**/src/**/*.js
+**/src/**/*.js.map
+**/src/**/*.d.ts
+*.tsbuildinfo
