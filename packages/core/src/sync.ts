@@ -4,7 +4,8 @@
  * `mergeItem`, so the richest data wins and nothing regresses.
  */
 import type { CanvasSnapshot, Course, WorkItem } from "./types.js";
-import { CanvasClient } from "./canvas/client.js";
+import { CanvasClient, CanvasError } from "./canvas/client.js";
+import { EgressError, assertPublicHttpsUrl, safeFetch, type EgressPolicy } from "./egress.js";
 import { applyAssignment, applyQuiz, hostOf, normaliseCourse, normalisePlannerItem, type NormaliseContext } from "./canvas/normalize.js";
 import { canvasFeedEventToItem, parseIcs } from "./ics.js";
 import { Store, itemVersionHash } from "./store/db.js";
@@ -60,22 +61,72 @@ export function saveItem(store: Store, userId: string, incoming: WorkItem, opts:
   return merged;
 }
 
+/** A message safe to show the student or log: our own generic errors pass, anything else is replaced. */
+export function syncErrorMessage(e: unknown, fallback = "could not be read"): string {
+  return e instanceof CanvasError || e instanceof EgressError ? e.message : fallback;
+}
+
+function unreadable(report: SyncReport, n: number): void {
+  if (n) report.errors.push(`${n} Canvas record(s) could not be read and were skipped`);
+}
+
 // ---- calendar feed ----------------------------------------------------
 
-export async function syncFeed(store: Store, userId: string, feedUrl: string, fetchImpl: typeof fetch = fetch): Promise<SyncReport> {
-  const res = await fetchImpl(feedUrl, { headers: { Accept: "text/calendar, */*" } });
-  if (!res.ok) throw new Error(`feed returned ${res.status}`);
-  const text = await res.text();
-  const host = hostOf(feedUrl);
-  const nowIso = new Date().toISOString();
-  let count = 0;
-  for (const ev of parseIcs(text)) {
-    const item = canvasFeedEventToItem(ev, nowIso, host);
-    if (!item) continue;
-    saveItem(store, userId, item);
-    count++;
+/** Largest feed accepted. A full term with descriptions is well under this. */
+export const FEED_MAX_BYTES = 5 * 1024 * 1024;
+
+/**
+ * The canonical form of a Canvas calendar feed URL, or an error:
+ * https (loopback http only under the test policy), public host, exactly
+ * `/feeds/calendars/user_<token>.ics`, no query string.
+ */
+export function assertCanvasFeedUrl(input: string, policy: EgressPolicy = {}): string {
+  let u: URL;
+  try {
+    u = new URL(input.trim());
+  } catch {
+    throw new CanvasError("that is not a Canvas calendar feed URL", 0, "");
   }
-  return { courses: 0, items: count, detailsFetched: 0, errors: [] };
+  if (u.search || !/^\/feeds\/calendars\/user_[A-Za-z0-9]+\.ics$/.test(u.pathname)) throw new CanvasError("that is not a Canvas calendar feed URL", 0, "");
+  assertPublicHttpsUrl(u, policy);
+  return `${u.origin}${u.pathname}`;
+}
+
+export interface FeedSyncOptions extends EgressPolicy {
+  signal?: AbortSignal;
+  timeoutMs?: number;
+}
+
+export async function syncFeed(store: Store, userId: string, feedUrl: string, opts: FeedSyncOptions = {}): Promise<SyncReport> {
+  const policy: EgressPolicy = opts.allowHttpLoopback ? { allowHttpLoopback: true } : {};
+  const url = assertCanvasFeedUrl(feedUrl, policy);
+  const init: RequestInit = { headers: { Accept: "text/calendar, */*" } };
+  if (opts.signal) init.signal = opts.signal;
+  const res = await safeFetch(url, init, { ...policy, maxBytes: FEED_MAX_BYTES, maxRedirects: 3, ...(opts.timeoutMs ? { timeoutMs: opts.timeoutMs } : {}) });
+  if (!res.ok) {
+    const gone = [401, 403, 404, 410].includes(res.status);
+    throw new CanvasError(gone ? "Canvas no longer serves this calendar feed; copy the link again from Canvas (Calendar, Calendar Feed)" : "the calendar feed could not be fetched; it will be retried", res.status, "");
+  }
+  const text = await res.text();
+  const host = hostOf(url);
+  const nowIso = new Date().toISOString();
+  const report: SyncReport = { courses: 0, items: 0, detailsFetched: 0, errors: [] };
+  let skipped = 0;
+  const events = parseIcs(text);
+  store.transaction(() => {
+    for (const ev of events) {
+      try {
+        const item = canvasFeedEventToItem(ev, nowIso, host);
+        if (!item) continue;
+        saveItem(store, userId, item);
+        report.items++;
+      } catch {
+        skipped++;
+      }
+    }
+  });
+  unreadable(report, skipped);
+  return report;
 }
 
 // ---- token sync -------------------------------------------------------
@@ -84,44 +135,65 @@ export async function syncWithClient(store: Store, userId: string, client: Canva
   const report: SyncReport = { courses: 0, items: 0, detailsFetched: 0, errors: [] };
   const nowIso = new Date().toISOString();
   const courses = new Map<string, Course>();
-  for (const raw of await client.courses()) {
-    const c = normaliseCourse(raw);
-    if (!c) continue;
-    courses.set(c.id, c);
-    store.upsertCourse(userId, c);
-    report.courses++;
-  }
+  let skipped = 0;
+  // Network first, then each phase's writes in one synchronous transaction.
+  const rawCourses = await client.courses();
+  store.transaction(() => {
+    for (const raw of rawCourses) {
+      try {
+        const c = normaliseCourse(raw);
+        if (!c) continue;
+        courses.set(c.id, c);
+        store.upsertCourse(userId, c);
+        report.courses++;
+      } catch {
+        skipped++;
+      }
+    }
+  });
   const ctx: NormaliseContext = { baseUrl: client.baseUrl, courses, now: nowIso };
 
   const start = new Date(Date.now() - PLANNER_PAST_DAYS * 86_400_000);
   const end = new Date(Date.now() + PLANNER_FUTURE_DAYS * 86_400_000);
   const planner = await client.plannerItems(isoDate(start), isoDate(end));
   const seen = new Map<string, WorkItem>();
-  for (const raw of planner) {
-    const item = normalisePlannerItem(raw, ctx);
-    if (!item) continue;
-    seen.set(item.id, saveItem(store, userId, item));
-    report.items++;
-  }
+  store.transaction(() => {
+    for (const raw of planner) {
+      try {
+        const item = normalisePlannerItem(raw, ctx);
+        if (!item) continue;
+        seen.set(item.id, saveItem(store, userId, item));
+        report.items++;
+      } catch {
+        skipped++;
+      }
+    }
+  });
 
   try {
-    for (const raw of await client.missingSubmissions()) {
-      const r = raw as Record<string, unknown>;
-      const courseRaw = r["course"];
-      const c = normaliseCourse(courseRaw);
-      if (c && !courses.has(c.id)) {
-        courses.set(c.id, c);
-        store.upsertCourse(userId, c);
+    const missing = await client.missingSubmissions();
+    store.transaction(() => {
+      for (const raw of missing) {
+        try {
+          const r = raw as Record<string, unknown>;
+          const c = normaliseCourse(r["course"]);
+          if (c && !courses.has(c.id)) {
+            courses.set(c.id, c);
+            store.upsertCourse(userId, c);
+          }
+          const existing = store.getItem(userId, `canvas:assignment:${String(r["id"])}`)?.item;
+          const item = applyAssignment(raw, ctx, existing);
+          if (!item) continue;
+          if (item.status === "open") item.status = "missing";
+          seen.set(item.id, saveItem(store, userId, item, { detailsFetched: true }));
+          report.detailsFetched++;
+        } catch {
+          skipped++;
+        }
       }
-      const existing = store.getItem(userId, `canvas:assignment:${String(r["id"])}`)?.item;
-      const item = applyAssignment(raw, ctx, existing);
-      if (!item) continue;
-      if (item.status === "open") item.status = "missing";
-      seen.set(item.id, saveItem(store, userId, item, { detailsFetched: true }));
-      report.detailsFetched++;
-    }
+    });
   } catch (e) {
-    report.errors.push(`missing_submissions: ${(e as Error).message}`);
+    report.errors.push(`missing submissions: ${syncErrorMessage(e)}`);
   }
 
   // Details for assignment-backed items that are new or changed since the last fetch.
@@ -141,16 +213,20 @@ export async function syncWithClient(store: Store, userId: string, client: Canva
           withQuiz = applyQuiz(await client.quiz(item.courseId, detailed.quizId), detailed);
           budget--;
         } catch (e) {
-          report.errors.push(`quiz ${detailed.quizId}: ${(e as Error).message}`);
+          report.errors.push(`quiz ${detailed.quizId}: ${syncErrorMessage(e)}`);
         }
       }
       saveItem(store, userId, withQuiz, { detailsFetched: true });
       report.detailsFetched++;
       budget--;
     } catch (e) {
-      report.errors.push(`assignment ${item.assignmentId}: ${(e as Error).message}`);
+      report.errors.push(`assignment ${item.assignmentId}: ${syncErrorMessage(e)}`);
+      // A stopped sync stops here rather than failing every remaining detail.
+      if (e instanceof CanvasError && e.status === 0) break;
+      if (e instanceof EgressError && e.code === "timeout") break;
     }
   }
+  unreadable(report, skipped);
   return report;
 }
 
@@ -159,41 +235,61 @@ export async function syncWithClient(store: Store, userId: string, client: Canva
 export function ingestSnapshot(store: Store, userId: string, snap: CanvasSnapshot): SyncReport {
   const report: SyncReport = { courses: 0, items: 0, detailsFetched: 0, errors: [] };
   const nowIso = snap.fetchedAt || new Date().toISOString();
-  const courses = store.courseMap(userId);
-  for (const raw of snap.courses ?? []) {
-    const c = normaliseCourse(raw);
-    if (!c) continue;
-    courses.set(c.id, c);
-    store.upsertCourse(userId, c);
-    report.courses++;
-  }
-  const ctx: NormaliseContext = { baseUrl: snap.baseUrl, courses, now: nowIso };
-  const seen = new Map<string, WorkItem>();
-  for (const raw of snap.plannerItems ?? []) {
-    const item = normalisePlannerItem(raw, ctx);
-    if (!item) continue;
-    seen.set(item.id, saveItem(store, userId, item));
-    report.items++;
-  }
-  for (const raw of snap.missingSubmissions ?? []) {
-    const r = raw as Record<string, unknown>;
-    const existing = store.getItem(userId, `canvas:assignment:${String(r["id"])}`)?.item;
-    const item = applyAssignment(raw, ctx, existing);
-    if (!item) continue;
-    if (item.status === "open") item.status = "missing";
-    seen.set(item.id, saveItem(store, userId, item, { detailsFetched: true }));
-    report.detailsFetched++;
-  }
-  for (const [assignmentId, raw] of Object.entries(snap.assignments ?? {})) {
-    const id = `canvas:assignment:${assignmentId}`;
-    const existing = seen.get(id) ?? store.getItem(userId, id)?.item;
-    const detailed = applyAssignment(raw, ctx, existing);
-    if (!detailed) continue;
-    let withQuiz = detailed;
-    const quizRaw = detailed.quizId ? snap.quizzes?.[detailed.quizId] : undefined;
-    if (quizRaw) withQuiz = applyQuiz(quizRaw, detailed);
-    seen.set(id, saveItem(store, userId, withQuiz, { detailsFetched: true }));
-    report.detailsFetched++;
-  }
+  let skipped = 0;
+  store.transaction(() => {
+    const courses = store.courseMap(userId);
+    for (const raw of snap.courses ?? []) {
+      try {
+        const c = normaliseCourse(raw);
+        if (!c) continue;
+        courses.set(c.id, c);
+        store.upsertCourse(userId, c);
+        report.courses++;
+      } catch {
+        skipped++;
+      }
+    }
+    const ctx: NormaliseContext = { baseUrl: snap.baseUrl, courses, now: nowIso };
+    const seen = new Map<string, WorkItem>();
+    for (const raw of snap.plannerItems ?? []) {
+      try {
+        const item = normalisePlannerItem(raw, ctx);
+        if (!item) continue;
+        seen.set(item.id, saveItem(store, userId, item));
+        report.items++;
+      } catch {
+        skipped++;
+      }
+    }
+    for (const raw of snap.missingSubmissions ?? []) {
+      try {
+        const r = raw as Record<string, unknown>;
+        const existing = store.getItem(userId, `canvas:assignment:${String(r["id"])}`)?.item;
+        const item = applyAssignment(raw, ctx, existing);
+        if (!item) continue;
+        if (item.status === "open") item.status = "missing";
+        seen.set(item.id, saveItem(store, userId, item, { detailsFetched: true }));
+        report.detailsFetched++;
+      } catch {
+        skipped++;
+      }
+    }
+    for (const [assignmentId, raw] of Object.entries(snap.assignments ?? {})) {
+      try {
+        const id = `canvas:assignment:${assignmentId}`;
+        const existing = seen.get(id) ?? store.getItem(userId, id)?.item;
+        const detailed = applyAssignment(raw, ctx, existing);
+        if (!detailed) continue;
+        let withQuiz = detailed;
+        const quizRaw = detailed.quizId ? snap.quizzes?.[detailed.quizId] : undefined;
+        if (quizRaw) withQuiz = applyQuiz(quizRaw, detailed);
+        seen.set(id, saveItem(store, userId, withQuiz, { detailsFetched: true }));
+        report.detailsFetched++;
+      } catch {
+        skipped++;
+      }
+    }
+  });
+  unreadable(report, skipped);
   return report;
 }

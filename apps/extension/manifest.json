@@ -5,7 +5,7 @@
   "description": "Reads your Canvas assignments with your own login and sends them to your planner server, so your AI assistant can plan your week. Read-only.",
   "permissions": ["storage", "alarms", "scripting"],
   "host_permissions": ["https://*.instructure.com/*"],
-  "optional_host_permissions": ["https://*/*"],
+  "optional_host_permissions": ["https://*/*", "http://localhost/*", "http://127.0.0.1/*"],
   "background": { "service_worker": "background.js", "type": "module" },
   "content_scripts": [{ "matches": ["https://*.instructure.com/*"], "js": ["content.js"], "run_at": "document_idle" }],
   "options_page": "options.html",

@@ -65,7 +65,6 @@ export class ClaudeEstimator implements LlmEstimator {
       item.isGroup ? "Group assignment" : undefined,
       item.quiz?.timeLimitMinutes ? `Quiz time limit: ${item.quiz.timeLimitMinutes} minutes` : undefined,
       item.quiz?.questionCount ? `Quiz questions: ${item.quiz.questionCount}` : undefined,
-      item.unlockAt && item.dueAt ? `Open from ${item.unlockAt} until due ${item.dueAt}` : item.dueAt ? `Due ${item.dueAt}` : undefined,
       "",
       "Description:",
       item.descriptionText ? truncate(item.descriptionText, 6000) : "(none)",

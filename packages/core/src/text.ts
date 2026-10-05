@@ -17,18 +17,41 @@ const ENTITIES: Record<string, string> = {
   ldquo: "“",
 };
 
+/** Longest HTML read; anything after it is dropped before any regex runs. */
+export const HTML_MAX_CHARS = 200_000;
+
+/** Drops `<tag ...> ... </tag>` blocks in one linear pass; an unclosed block runs to the end. */
+function dropBlocks(s: string, tag: string): string {
+  const open = new RegExp(`<${tag}`, "gi");
+  const close = new RegExp(`</${tag}`, "gi");
+  let out = "";
+  let i = 0;
+  for (;;) {
+    open.lastIndex = i;
+    const start = open.exec(s);
+    if (!start) return out + s.slice(i);
+    out += s.slice(i, start.index) + " ";
+    close.lastIndex = open.lastIndex;
+    const end = close.exec(s);
+    if (!end) return out;
+    const gt = s.indexOf(">", close.lastIndex);
+    if (gt < 0) return out;
+    i = gt + 1;
+  }
+}
+
 export function htmlToText(html: string | null | undefined): string {
   if (!html) return "";
-  let s = html;
-  s = s.replace(/<(script|style)[\s\S]*?<\/\1>/gi, " ");
+  let s = html.length > HTML_MAX_CHARS ? html.slice(0, HTML_MAX_CHARS) : html;
+  s = dropBlocks(dropBlocks(s, "script"), "style");
   s = s.replace(/<br\s*\/?>/gi, "\n");
   s = s.replace(/<\/(p|div|li|h[1-6]|tr|blockquote|pre)>/gi, "\n");
-  s = s.replace(/<li[^>]*>/gi, "• ");
-  s = s.replace(/<[^>]+>/g, " ");
-  s = s.replace(/&(#x?[0-9a-f]+|[a-z]+);/gi, (m, code: string) => {
+  s = s.replace(/<li\b[^<>]*>/gi, "• ");
+  s = s.replace(/<[^<>]*>/g, " ");
+  s = s.replace(/&(#x[0-9a-f]{1,8}|#[0-9]{1,8}|[a-z]{1,32});/gi, (m, code: string) => {
     if (code[0] === "#") {
       const n = code[1]?.toLowerCase() === "x" ? parseInt(code.slice(2), 16) : parseInt(code.slice(1), 10);
-      return Number.isFinite(n) ? String.fromCodePoint(n) : m;
+      return Number.isFinite(n) && n >= 0 && n <= 0x10ffff ? String.fromCodePoint(n) : m;
     }
     return ENTITIES[code.toLowerCase()] ?? m;
   });

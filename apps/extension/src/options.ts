@@ -1,5 +1,5 @@
 /** Options page: pair with the server, grant Canvas hosts, see sync status. */
-import { loadSettings, saveSettings } from "./shared.js";
+import { loadSettings, originPattern, saveSettings, serverOrigin } from "./shared.js";
 
 const $ = <T extends HTMLElement>(id: string): T => document.getElementById(id) as T;
 
@@ -19,11 +19,16 @@ async function render(): Promise<void> {
 
 $<HTMLFormElement>("pair-form").addEventListener("submit", async (e) => {
   e.preventDefault();
-  const serverUrl = $<HTMLInputElement>("server").value.trim().replace(/\/$/, "");
+  const raw = $<HTMLInputElement>("server").value.trim();
   const code = $<HTMLInputElement>("code").value.trim().toUpperCase();
   const out = $<HTMLElement>("pair-result");
   try {
-    const res = await fetch(`${serverUrl}/api/pair`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ code, name: navigator.userAgent.includes("Firefox") ? "Firefox" : "Chrome" }) });
+    const serverUrl = serverOrigin(/^https?:\/\//i.test(raw) ? raw : `https://${raw}`);
+    if (!serverUrl) throw new Error("the server address must start with https:// (http only for localhost)");
+    // Without a host permission for the server, the worker's requests are blocked as cross-origin.
+    const granted = await chrome.permissions.request({ origins: [originPattern(serverUrl)] });
+    if (!granted) throw new Error("permission to reach the planner server was not granted");
+    const res = await fetch(`${serverUrl}/api/pair`, { method: "POST", credentials: "omit", headers: { "content-type": "application/json" }, body: JSON.stringify({ code, name: navigator.userAgent.includes("Firefox") ? "Firefox" : "Chrome" }) });
     const body = (await res.json()) as { deviceToken?: string; error?: string };
     if (!res.ok || !body.deviceToken) throw new Error(body.error ?? `server ${res.status}`);
     await saveSettings({ serverUrl, deviceToken: body.deviceToken });

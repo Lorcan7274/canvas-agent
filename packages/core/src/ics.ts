@@ -41,7 +41,18 @@ function unescapeText(v: string): string {
 }
 
 export function escapeText(v: string): string {
-  return v.replace(/\\/g, "\\\\").replace(/;/g, "\\;").replace(/,/g, "\\,").replace(/\r?\n/g, "\\n");
+  return v.replace(/\\/g, "\\\\").replace(/;/g, "\\;").replace(/,/g, "\\,").replace(/\r\n|\r|\n/g, "\\n");
+}
+
+/** An http(s) URL in canonical form (the URL parser drops CR, LF and tabs), or undefined. */
+export function safeHttpUrl(v: string | undefined): string | undefined {
+  if (!v) return undefined;
+  try {
+    const u = new URL(v.trim());
+    return u.protocol === "https:" || u.protocol === "http:" ? u.toString() : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /** Parses an iCalendar date or date-time. Floating times are treated as UTC. */
@@ -147,7 +158,8 @@ export function canvasFeedEventToItem(ev: IcsEvent, nowIso: string, host?: strin
   if (host) item.host = host;
   if (canvasId) item.canvasId = canvasId;
   if (courseCode) item.courseCode = courseCode;
-  if (ev.url) item.url = ev.url;
+  const url = safeHttpUrl(ev.url);
+  if (url) item.url = url;
   if (ev.start) item.dueAt = ev.start;
   if (ev.description) {
     const text = htmlToText(ev.description);
@@ -176,8 +188,10 @@ function fold(line: string): string {
   const out: string[] = [];
   let rest = line;
   while (rest.length > 73) {
-    out.push(rest.slice(0, 73));
-    rest = " " + rest.slice(73);
+    // Never split a surrogate pair across the fold.
+    const cut = /[\ud800-\udbff]/.test(rest[72]!) ? 72 : 73;
+    out.push(rest.slice(0, cut));
+    rest = " " + rest.slice(cut);
   }
   out.push(rest);
   return out.join("\r\n");
@@ -194,13 +208,14 @@ export function writeIcs(calendarName: string, events: IcsWriteEvent[], nowIso =
   ];
   for (const e of events) {
     lines.push("BEGIN:VEVENT");
-    lines.push(`UID:${e.uid}`);
+    lines.push(fold(`UID:${escapeText(e.uid)}`));
     lines.push(`DTSTAMP:${fmtUtc(nowIso)}`);
     lines.push(`DTSTART:${fmtUtc(e.start)}`);
     lines.push(`DTEND:${fmtUtc(e.end)}`);
     lines.push(fold(`SUMMARY:${escapeText(e.summary)}`));
     if (e.description) lines.push(fold(`DESCRIPTION:${escapeText(e.description)}`));
-    if (e.url) lines.push(fold(`URL:${e.url}`));
+    const url = safeHttpUrl(e.url);
+    if (url) lines.push(fold(`URL:${url}`));
     lines.push("END:VEVENT");
   }
   lines.push("END:VCALENDAR");

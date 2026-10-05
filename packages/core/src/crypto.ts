@@ -45,11 +45,23 @@ export function safeEqual(a: string, b: string): boolean {
   return ba.length === bb.length && timingSafeEqual(ba, bb);
 }
 
-/** Six-character pairing codes without look-alike characters. */
+const PAIRING_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+/** Characters in a pairing code: a 4-character lookup and an 8-character secret, 60 bits in all. */
+export const PAIRING_CODE_LENGTH = 12;
+export const PAIRING_LOOKUP_LENGTH = 4;
+
+/** Twelve characters without look-alikes, shown as ABCD-EFGH-JKLM. 256 is a multiple of 32, so no modulo bias. */
 export function pairingCode(): string {
-  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-  const bytes = randomBytes(6);
+  const bytes = randomBytes(PAIRING_CODE_LENGTH);
   let out = "";
-  for (const b of bytes) out += alphabet[b % alphabet.length];
-  return out;
+  for (const b of bytes) out += PAIRING_ALPHABET[b % PAIRING_ALPHABET.length];
+  return out.match(/.{4}/g)!.join("-");
+}
+
+/** What the student typed, uppercased with spaces and dashes removed; undefined when it cannot be a code. */
+export function normalisePairingCode(input: string): string | undefined {
+  const s = input.toUpperCase().replace(/[\s-]+/g, "");
+  if (s.length !== PAIRING_CODE_LENGTH) return undefined;
+  for (const ch of s) if (!PAIRING_ALPHABET.includes(ch)) return undefined;
+  return s;
 }

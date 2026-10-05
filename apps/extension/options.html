@@ -18,7 +18,7 @@ button.quiet{background:#fff;color:#333;border-color:#bbb}p.out{color:#444;min-h
 <p>On the server's settings page, generate a pairing code, then enter it here within 15 minutes. Status: <b id="paired"></b></p>
 <form id="pair-form">
   <label>Server URL</label><input id="server" placeholder="https://planner.example.com" required>
-  <label>Pairing code</label><input id="code" placeholder="ABC123" required>
+  <label>Pairing code</label><input id="code" placeholder="ABCD-EFGH-JKLM" autocomplete="off" required>
   <button type="submit">Pair</button>
 </form>
 <p class="out" id="pair-result"></p>

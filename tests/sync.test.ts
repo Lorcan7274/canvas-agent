@@ -15,7 +15,7 @@ describe("token sync against the stub Canvas", () => {
   it("pulls courses, planner items, details and quiz facts, surviving pagination and a 429", async () => {
     const store = new Store();
     const user = store.createUser("sam@example.edu", "Sam", {});
-    const client = new CanvasClient({ baseUrl: stub.origin, token: stub.token, sleep: async () => {} });
+    const client = new CanvasClient({ baseUrl: stub.origin, token: stub.token, sleep: async () => {}, allowHttpLoopback: true });
     const report = await syncWithClient(store, user.id, client);
     expect(report.courses).toBe(3);
     expect(report.errors).toEqual([]);
@@ -48,7 +48,7 @@ describe("token sync against the stub Canvas", () => {
   it("does not refetch unchanged details on a second sync", async () => {
     const store = new Store();
     const user = store.createUser(null, null, {});
-    const client = new CanvasClient({ baseUrl: stub.origin, token: stub.token, sleep: async () => {} });
+    const client = new CanvasClient({ baseUrl: stub.origin, token: stub.token, sleep: async () => {}, allowHttpLoopback: true });
     await syncWithClient(store, user.id, client);
     const before = stub.requests.filter((r) => /\/assignments\/\d+/.test(r)).length;
     await syncWithClient(store, user.id, client);
@@ -62,20 +62,20 @@ describe("feed sync", () => {
   it("creates thin items that a later token sync enriches without losing the feed's due dates", async () => {
     const store = new Store();
     const user = store.createUser(null, null, {});
-    const feed = await syncFeed(store, user.id, stub.feedUrl);
+    const feed = await syncFeed(store, user.id, stub.feedUrl, { allowHttpLoopback: true });
     expect(feed.items).toBeGreaterThanOrEqual(10);
     const thin = store.getItem(user.id, "canvas:assignment:2001")!.item;
     expect(thin.source).toBe("feed");
     expect(thin.courseCode).toBe("SOC 110");
     expect(thin.pointsPossible).toBeUndefined();
 
-    const client = new CanvasClient({ baseUrl: stub.origin, token: stub.token, sleep: async () => {} });
+    const client = new CanvasClient({ baseUrl: stub.origin, token: stub.token, sleep: async () => {}, allowHttpLoopback: true });
     await syncWithClient(store, user.id, client);
     const rich = store.getItem(user.id, "canvas:assignment:2001")!.item;
     expect(rich.source).toBe("canvas");
     expect(rich.pointsPossible).toBe(100);
 
-    await syncFeed(store, user.id, stub.feedUrl);
+    await syncFeed(store, user.id, stub.feedUrl, { allowHttpLoopback: true });
     const again = store.getItem(user.id, "canvas:assignment:2001")!.item;
     expect(again.pointsPossible).toBe(100);
     expect(again.source).toBe("canvas");
@@ -86,7 +86,7 @@ describe("extension snapshot ingest", () => {
   it("accepts raw Canvas JSON read with a session cookie", async () => {
     const cookieFetch: typeof fetch = (input, init) =>
       fetch(input, { ...init, headers: { ...(init?.headers as Record<string, string>), cookie: "canvas_session=ok" } });
-    const client = new CanvasClient({ baseUrl: stub.origin, fetch: cookieFetch, withCredentials: true, sleep: async () => {} });
+    const client = new CanvasClient({ baseUrl: stub.origin, fetch: cookieFetch, withCredentials: true, sleep: async () => {}, allowHttpLoopback: true });
     const courses = await client.courses();
     const plannerItems = await client.plannerItems("2026-01-01", "2027-12-31");
     const assignments: Record<string, unknown> = {};
@@ -114,7 +114,7 @@ describe("estimates over synced items", () => {
   it("produces heuristic priors and calibrates from a logged actual", async () => {
     const store = new Store();
     const user = store.createUser(null, null, {});
-    const client = new CanvasClient({ baseUrl: stub.origin, token: stub.token, sleep: async () => {} });
+    const client = new CanvasClient({ baseUrl: stub.origin, token: stub.token, sleep: async () => {}, allowHttpLoopback: true });
     await syncWithClient(store, user.id, client);
     const svc = new EstimateService(store);
     const ps5 = store.getItem(user.id, "canvas:assignment:1001")!.item;

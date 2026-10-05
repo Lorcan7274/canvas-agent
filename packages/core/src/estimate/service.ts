@@ -9,7 +9,7 @@ import { heuristicEstimate } from "./heuristic.js";
 import { applyCalibration, calibrate, type RatioSample } from "./calibrate.js";
 import type { LlmEstimator } from "./llm.js";
 import { itemVersionHash } from "../store/db.js";
-import { shortHash } from "../text.js";
+import { shortHash, truncate } from "../text.js";
 
 export interface EstimateOptions {
   /** Ask the model for items it has not seen. Costs a call per new assignment. */
@@ -21,8 +21,6 @@ export interface FullEstimate extends Estimate {
   calibrationSamples: number;
   pooled?: { medianHours: number; n: number };
 }
-
-const PRIOR_SIGMA = 0.5;
 
 export class EstimateService {
   constructor(
@@ -46,36 +44,15 @@ export class EstimateService {
     return pts[Math.floor(pts.length / 2)];
   }
 
-  async prior(userId: string, item: WorkItem, opts: EstimateOptions = {}): Promise<{ estimate: Estimate; sigma: number }> {
+  /**
+   * The prior without calling the model: the shared task card when one is
+   * cached for exactly this item version, else this student's own heuristic.
+   * Heuristic priors are never shared: they read the student's course median.
+   */
+  quickPrior(userId: string, item: WorkItem): { estimate: Estimate; sigma: number } {
     const versionHash = itemVersionHash(item, shortHash);
-    const key = this.priorKey(item, versionHash);
-    const cached = this.store.getPrior(key);
-    if (cached && (cached.basis === "llm" || !opts.useLlm || !this.llm)) {
-      return { estimate: cached, sigma: cached.basis === "llm" ? sigmaFor(cached.confidence) : PRIOR_SIGMA };
-    }
-    const nowIso = new Date().toISOString();
-    if (opts.useLlm && this.llm && item.kind !== "event") {
-      try {
-        const card = await this.llm.taskCard(item);
-        if (card) {
-          const est: Estimate = {
-            itemId: item.id,
-            p50Hours: round(card.p50_hours),
-            p80Hours: round(Math.max(card.p80_hours, card.p50_hours)),
-            basis: "llm",
-            confidence: card.confidence,
-            reasoning: card.reasoning,
-            steps: card.steps,
-            versionHash,
-            createdAt: nowIso,
-          };
-          this.store.putPrior(key, est);
-          return { estimate: est, sigma: sigmaFor(card.confidence) };
-        }
-      } catch {
-        // fall through to the heuristic; the model is optional
-      }
-    }
+    const cached = this.store.getPrior(this.priorKey(item, versionHash));
+    if (cached && cached.basis === "llm") return { estimate: cached, sigma: sigmaFor(cached.confidence) };
     const h = heuristicEstimate(item, { coursePointsMedian: this.coursePointsMedian(userId, item.courseId) });
     const est: Estimate = {
       itemId: item.id,
@@ -86,10 +63,37 @@ export class EstimateService {
       reasoning: h.reasoning,
       steps: h.steps,
       versionHash,
-      createdAt: nowIso,
+      createdAt: new Date().toISOString(),
     };
-    this.store.putPrior(key, est);
     return { estimate: est, sigma: h.sigma };
+  }
+
+  async prior(userId: string, item: WorkItem, opts: EstimateOptions = {}): Promise<{ estimate: Estimate; sigma: number }> {
+    const quick = this.quickPrior(userId, item);
+    if (quick.estimate.basis === "llm" || !opts.useLlm || !this.llm || item.kind === "event") return quick;
+    const versionHash = quick.estimate.versionHash;
+    try {
+      const card = await this.llm.taskCard(item);
+      if (card) {
+        // Model output is shown to every student with this assignment: keep it short and treat it as data.
+        const est: Estimate = {
+          itemId: item.id,
+          p50Hours: round(card.p50_hours),
+          p80Hours: round(Math.max(card.p80_hours, card.p50_hours)),
+          basis: "llm",
+          confidence: card.confidence,
+          reasoning: truncate(card.reasoning, 1000),
+          steps: card.steps.slice(0, 10).map((s) => truncate(s, 200)),
+          versionHash,
+          createdAt: new Date().toISOString(),
+        };
+        this.store.putPrior(this.priorKey(item, versionHash), est);
+        return { estimate: est, sigma: sigmaFor(card.confidence) };
+      }
+    } catch {
+      // fall through to the heuristic; the model is optional
+    }
+    return quick;
   }
 
   async estimate(userId: string, item: WorkItem, opts: EstimateOptions = {}): Promise<FullEstimate> {

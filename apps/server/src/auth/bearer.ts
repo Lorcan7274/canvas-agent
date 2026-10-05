@@ -19,15 +19,22 @@ export function userIdOf(auth: AuthInfo | undefined): string {
 export class TokenVerifier implements OAuthTokenVerifier {
   constructor(
     private readonly store: Store,
-    private readonly resource: URL,
+    /** The MCP endpoint URL: every token we accept is for it, and `requireBearerAuth` checks so. */
+    readonly resource: URL,
   ) {}
 
   async verifyAccessToken(token: string): Promise<AuthInfo> {
     if (token.startsWith("ck_")) {
-      const userId = this.store.userForConnectorKey(hashToken(token));
+      const hash = hashToken(token);
+      const key = this.store.getConnectorKeyByHash(hash);
+      if (!key) throw new InvalidTokenError("unknown connector key");
+      const keyExpiry = key.expiresAt ? Date.parse(key.expiresAt) : Infinity;
+      if (!(keyExpiry > Date.now())) throw new InvalidTokenError("connector key expired");
+      const userId = this.store.userForConnectorKey(hash);
       if (!userId) throw new InvalidTokenError("unknown connector key");
-      // Connector keys do not expire on their own; the SDK wants a horizon, so give each check an hour.
-      return { token, clientId: "connector-key", scopes: MCP_SCOPES, expiresAt: Math.floor(Date.now() / 1000) + 3600, resource: this.resource, extra: { userId, kind: "connector-key" } };
+      // The SDK wants a horizon: an hour per check, or the key's own expiry if sooner.
+      const expiresAt = Math.floor(Math.min(Date.now() + 3_600_000, keyExpiry) / 1000);
+      return { token, clientId: "connector-key", scopes: MCP_SCOPES, expiresAt, resource: this.resource, extra: { userId, kind: "connector-key" } };
     }
     const row = this.store.getOAuthToken(hashToken(token));
     if (!row || row.kind !== "access") throw new InvalidTokenError("unknown token");
@@ -39,7 +46,8 @@ export class TokenVerifier implements OAuthTokenVerifier {
       expiresAt: Math.floor(new Date(row.expiresAt).getTime() / 1000),
       extra: { userId: row.userId, kind: "oauth" },
     };
-    if (row.resource) info.resource = new URL(row.resource);
+    // Tokens from before resources were enforced carry none; they were only ever issued for this endpoint.
+    info.resource = row.resource ? new URL(row.resource) : this.resource;
     return info;
   }
 }

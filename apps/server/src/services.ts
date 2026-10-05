@@ -4,16 +4,21 @@
  */
 import {
   CanvasClient,
+  EgressError,
   EstimateService,
   Sealer,
   Store,
   TIME_BUCKETS,
+  assertCanvasFeedUrl,
+  assertPublicHttpsUrl,
   formatLocal,
   hashToken,
+  isLoopbackHostname,
   isValidTimeZone,
   normaliseBaseUrl,
   planBlocks,
   randomToken,
+  syncErrorMessage,
   syncFeed,
   syncWithClient,
   writeIcs,
@@ -27,7 +32,8 @@ import {
   type WorkItem,
 } from "@canvas-agent/core";
 import type { Config } from "./config.js";
-import { BLOCK_PROPERTY, GoogleCalendar } from "./google/calendar.js";
+import { randomBytes } from "node:crypto";
+import { BLOCK_PROPERTY, GoogleCalendar, googleErrorMessage } from "./google/calendar.js";
 
 export interface WorkloadItem {
   id: string;
@@ -76,12 +82,45 @@ export interface CommitInput {
 }
 
 export interface CommitResult {
-  created: Array<StudyBlock & { title: string; startLocal: string; calendarWritten: boolean }>;
+  created: Array<{ itemId: string; title: string; start: string; end: string; startLocal: string; minutes: number; calendarWritten: boolean }>;
   replaced: number;
+  /** "ics": in the plan feed only; its link is on the settings page, never in a tool result. */
   calendar: "google" | "ics" | "none";
-  icsFeedUrl?: string;
   errors: string[];
 }
+
+/** What get_assignment shows: the student's view of one item, without storage internals. */
+export interface AssignmentView {
+  item: {
+    id: string;
+    title: string;
+    kind: WorkItem["kind"];
+    status: WorkItem["status"];
+    course?: { code?: string; name?: string };
+    dueAt?: string;
+    unlockAt?: string;
+    lockAt?: string;
+    pointsPossible?: number;
+    submissionTypes?: string[];
+    allowedAttempts?: number;
+    rubricCriteria?: number;
+    peerReviews?: boolean;
+    isGroup?: boolean;
+    quiz?: WorkItem["quiz"];
+    url?: string;
+    late?: boolean;
+    submittedAt?: string;
+    descriptionText?: string;
+  };
+  estimate: { p50Hours: number; p80Hours: number; basis: FullEstimate["basis"]; confidence: FullEstimate["confidence"]; reasoning?: string; steps?: string[]; pooledMedianHours?: number };
+  blocks: Array<{ start: string; end: string; startLocal: string; minutes: number; status: StudyBlock["status"] }>;
+  sameCourseHistory: Array<{ title: string; minutes: number; estimatedHours: number | null }>;
+  dueLocal?: string;
+}
+
+/** Interactive syncs (a button, a tool call) stop after this; the jobs allow longer. */
+export const INTERACTIVE_SYNC_DEADLINE_MS = 45_000;
+const DESCRIPTION_CHARS_SHOWN = 8000;
 
 const DUE_SOON_HOURS = 72;
 
@@ -120,39 +159,73 @@ export class Services {
     return token;
   }
 
-  feedToken(userId: string): string {
-    // Deterministic per user so the subscription URL survives restarts; sealed secret, not a hash of the id.
-    return hashToken(`plan-feed:${userId}:${this.config.secretKey}`).slice(0, 32);
+  // ---- the plan feed (a random capability URL, stored hashed for lookup and sealed for display) --
+
+  private newFeedToken(userId: string): string {
+    const token = randomBytes(16).toString("hex");
+    this.store.putFeedToken(userId, hashToken(token), this.sealer.seal(token));
+    return token;
+  }
+
+  private feedToken(userId: string): string {
+    const sealed = this.store.getFeedTokenSealed(userId);
+    if (sealed) {
+      try {
+        return this.sealer.open(sealed);
+      } catch {
+        // SECRET_KEY changed: issue a new link
+      }
+    }
+    return this.newFeedToken(userId);
   }
 
   userForFeedToken(token: string): string | undefined {
-    for (const u of this.store.listUsers()) if (this.feedToken(u.id) === token) return u.id;
-    return undefined;
+    return this.store.userForFeedTokenHash(hashToken(token));
   }
 
+  /** The student's plan feed URL, created on first use. A capability: show it on the settings page only. */
   planFeedUrl(userId: string): string {
     return `${this.config.baseUrl}/feeds/plan/${this.feedToken(userId)}.ics`;
   }
 
+  /** A new plan feed URL; the old one stops working at once. For a "Regenerate feed link" button. */
+  rotateFeedToken(userId: string): string {
+    this.userOrThrow(userId);
+    return `${this.config.baseUrl}/feeds/plan/${this.newFeedToken(userId)}.ics`;
+  }
+
+  /** "Delete my data": every row this student owns, in one transaction. Calendar events already written stay. */
+  deleteUserData(userId: string): void {
+    this.store.deleteUserData(userId);
+  }
+
   // ---- canvas accounts ------------------------------------------------
+
+  private get egress(): { allowHttpLoopback?: boolean } {
+    return this.config.allowLoopbackEgress ? { allowHttpLoopback: true } : {};
+  }
 
   addTokenAccount(userId: string, baseUrl: string, token: string): CanvasAccount {
     const url = normaliseBaseUrl(baseUrl);
+    assertPublicHttpsUrl(url, this.egress);
     this.assertCanvasHost(url);
-    return this.store.upsertCanvasAccount({ userId, baseUrl: url, kind: "token", secretSealed: this.sealer.seal(token) });
+    if (!token.trim() || token.length > 512) throw new Error("that does not look like a Canvas access token");
+    return this.store.upsertCanvasAccount({ userId, baseUrl: url, kind: "token", secretSealed: this.sealer.seal(token.trim()) });
   }
 
   addFeedAccount(userId: string, feedUrl: string): CanvasAccount {
-    const u = new URL(feedUrl.trim());
-    if (u.protocol !== "https:" && !u.hostname.match(/^(localhost|127\.0\.0\.1)$/)) throw new Error("feed URL must be https");
-    if (!/\/feeds\/calendars\/user_[A-Za-z0-9]+\.ics$/.test(u.pathname)) throw new Error("that is not a Canvas calendar feed URL");
-    const base = `${u.protocol}//${u.host}`;
+    const url = assertCanvasFeedUrl(feedUrl, this.egress);
+    const base = new URL(url).origin;
     this.assertCanvasHost(base);
-    return this.store.upsertCanvasAccount({ userId, baseUrl: base, kind: "feed", secretSealed: this.sealer.seal(u.toString()) });
+    return this.store.upsertCanvasAccount({ userId, baseUrl: base, kind: "feed", secretSealed: this.sealer.seal(url) });
   }
 
+  /** The server never fetches a session account; the address only has to be a sane https origin. */
   addSessionAccount(userId: string, baseUrl: string): CanvasAccount {
     const url = normaliseBaseUrl(baseUrl);
+    const u = new URL(url);
+    const loopback = this.config.allowLoopbackEgress && isLoopbackHostname(u.hostname);
+    if (u.protocol !== "https:" && !loopback) throw new Error("Canvas must be https");
     this.assertCanvasHost(url);
     return this.store.upsertCanvasAccount({ userId, baseUrl: url, kind: "session" });
   }
@@ -164,24 +237,44 @@ export class Services {
     if (!allow.some((h) => host === h || host.endsWith("." + h))) throw new Error(`Canvas host ${host} is not allowed on this server`);
   }
 
-  async syncAccount(account: CanvasAccount): Promise<SyncReport> {
+  /**
+   * One sync, bounded by a deadline that also cancels its requests. Never
+   * throws; the result's errors and the account's last error are generic.
+   */
+  async syncAccount(account: CanvasAccount, opts: { deadlineMs?: number } = {}): Promise<SyncReport> {
+    if (account.kind === "session") return { courses: 0, items: 0, detailsFetched: 0, errors: [] }; // the extension pushes
+    const ctrl = new AbortController();
+    const stopped = new Promise<never>((_, reject) => {
+      ctrl.signal.addEventListener("abort", () => reject(new EgressError("the sync took too long and was stopped; it will be retried", "timeout")), { once: true });
+    });
+    const timer = setTimeout(() => ctrl.abort(), opts.deadlineMs ?? INTERACTIVE_SYNC_DEADLINE_MS);
+    timer.unref?.();
     try {
-      let report: SyncReport;
-      if (account.kind === "token") {
-        const token = this.sealer.open(account.secretSealed ?? "");
-        report = await syncWithClient(this.store, account.userId, new CanvasClient({ baseUrl: account.baseUrl, token }));
-      } else if (account.kind === "feed") {
-        report = await syncFeed(this.store, account.userId, this.sealer.open(account.secretSealed ?? ""));
-      } else {
-        return { courses: 0, items: 0, detailsFetched: 0, errors: [] }; // the extension pushes
-      }
-      this.store.markSync(account.id, report.errors.length ? report.errors.join("; ").slice(0, 500) : null);
+      const work = (async (): Promise<SyncReport> => {
+        if (account.kind === "token") {
+          const token = this.sealer.open(account.secretSealed ?? "");
+          return syncWithClient(this.store, account.userId, new CanvasClient({ baseUrl: account.baseUrl, token, signal: ctrl.signal, ...this.egress }));
+        }
+        return syncFeed(this.store, account.userId, this.sealer.open(account.secretSealed ?? ""), { signal: ctrl.signal, ...this.egress });
+      })();
+      const report = await Promise.race([work, stopped]);
+      this.store.markSync(account.id, report.errors.length ? report.errors.join("; ").slice(0, 500) : null, true);
       return report;
     } catch (e) {
-      const msg = (e as Error).message.slice(0, 500);
-      this.store.markSync(account.id, msg);
+      const msg = syncErrorMessage(e, "the sync failed; it will be retried").slice(0, 500);
+      this.store.markSync(account.id, msg, false);
       return { courses: 0, items: 0, detailsFetched: 0, errors: [msg] };
+    } finally {
+      clearTimeout(timer);
+      ctrl.abort();
     }
+  }
+
+  /** Starts a sync and returns at once, e.g. right after an account is added. */
+  syncInBackground(account: CanvasAccount, log: (msg: string) => void = () => {}): void {
+    void this.syncAccount(account).then((r) => {
+      if (r.errors.length) log(`first sync ${account.kind} ${new URL(account.baseUrl).host}: ${r.errors.join("; ")}`);
+    });
   }
 
   async syncUser(userId: string): Promise<SyncReport[]> {
@@ -259,21 +352,35 @@ export class Services {
     return out;
   }
 
-  async assignment(userId: string, itemId: string) {
+  async assignment(userId: string, itemId: string): Promise<AssignmentView> {
     const user = this.userOrThrow(userId);
     const row = this.store.getItem(userId, itemId);
     if (!row) throw new Error(`no item ${itemId}`);
-    const item = row.item;
-    const est = await this.estimates.estimate(userId, item, { useLlm: this.config.useLlm });
-    const blocks = this.store.listBlocks(userId, { itemId }).map((b) => ({ ...b, startLocal: formatLocal(b.start, user.prefs.timezone) }));
+    const i = row.item;
+    const est = await this.estimates.estimate(userId, i, { useLlm: this.config.useLlm });
+    const blocks = this.store
+      .listBlocks(userId, { itemId })
+      .map((b) => ({ start: b.start, end: b.end, startLocal: formatLocal(b.start, user.prefs.timezone), minutes: b.minutes, status: b.status }));
     const history = this.store
       .listActuals(userId)
       .filter((a) => a.itemId !== itemId)
       .map((a) => ({ a, item: this.store.getItem(userId, a.itemId)?.item }))
-      .filter((x) => x.item && x.item.courseId === item.courseId)
+      .filter((x) => x.item && x.item.courseId === i.courseId)
       .slice(-5)
       .map((x) => ({ title: x.item!.title, minutes: x.a.minutes, estimatedHours: x.a.estimatedHours }));
-    return { item, estimate: est, blocks, sameCourseHistory: history, dueLocal: item.dueAt ? formatLocal(item.dueAt, user.prefs.timezone) : undefined };
+    const item: AssignmentView["item"] = { id: i.id, title: i.title, kind: i.kind, status: i.status };
+    if (i.courseCode || i.courseName) item.course = { ...(i.courseCode ? { code: i.courseCode } : {}), ...(i.courseName ? { name: i.courseName } : {}) };
+    for (const k of ["dueAt", "unlockAt", "lockAt", "pointsPossible", "submissionTypes", "allowedAttempts", "rubricCriteria", "peerReviews", "isGroup", "quiz", "url", "late", "submittedAt"] as const) {
+      if (i[k] !== undefined) (item as Record<string, unknown>)[k] = i[k];
+    }
+    if (i.descriptionText) item.descriptionText = i.descriptionText.slice(0, DESCRIPTION_CHARS_SHOWN);
+    const estimate: AssignmentView["estimate"] = { p50Hours: est.p50Hours, p80Hours: est.p80Hours, basis: est.basis, confidence: est.confidence };
+    if (est.reasoning) estimate.reasoning = est.reasoning;
+    if (est.steps?.length) estimate.steps = est.steps;
+    if (est.pooled) estimate.pooledMedianHours = est.pooled.medianHours;
+    const out: AssignmentView = { item, estimate, blocks, sameCourseHistory: history };
+    if (i.dueAt) out.dueLocal = formatLocal(i.dueAt, user.prefs.timezone);
+    return out;
   }
 
   // ---- planning -------------------------------------------------------
@@ -318,7 +425,7 @@ export class Services {
           busySource = opts.busy?.length ? "google+provided" : "google";
         }
       } catch (e) {
-        notes.push(`could not read Google Calendar busy time: ${(e as Error).message}`);
+        notes.push(`could not read Google Calendar busy time: ${googleErrorMessage(e)}`);
       }
     }
     if (busySource === "none") notes.push("No calendar busy time was available; blocks assume the work windows in your preferences are free. Pass busy intervals from your calendar for a better plan.");
@@ -377,13 +484,13 @@ export class Services {
     const errors: string[] = [];
     let replaced = 0;
     const google = this.google ? this.store.getGoogleAccount(userId) : undefined;
-    const token = input.calendar !== false && google ? await this.googleAccessToken(userId).catch((e) => (errors.push(`Google token: ${(e as Error).message}`), undefined)) : undefined;
+    const token = input.calendar !== false && google ? await this.googleAccessToken(userId).catch((e) => (errors.push(`Google token: ${googleErrorMessage(e)}`), undefined)) : undefined;
     if (input.replace) {
       for (const itemId of new Set(input.blocks.map((b) => b.itemId))) {
         for (const victim of this.store.deleteBlocksForItem(userId, itemId, ["planned"])) {
           replaced++;
           if (victim.calendarEventId && token && google) {
-            await this.google!.deleteEvent(token, victim.calendarId ?? google.calendarId, victim.calendarEventId).catch((e) => errors.push(`delete event: ${(e as Error).message}`));
+            await this.google!.deleteEvent(token, victim.calendarId ?? google.calendarId, victim.calendarEventId).catch((e) => errors.push(`delete event: ${googleErrorMessage(e)}`));
           }
         }
       }
@@ -418,14 +525,12 @@ export class Services {
           block = this.store.getBlock(userId, block.id)!;
           written = true;
         } catch (e) {
-          errors.push(`Google event for ${item.title}: ${(e as Error).message}`);
+          errors.push(`Google event for ${item.title}: ${googleErrorMessage(e)}`);
         }
       }
-      created.push({ ...block, title: item.title, startLocal: formatLocal(block.start, user.prefs.timezone), calendarWritten: written });
+      created.push({ itemId: block.itemId, title: item.title, start: block.start, end: block.end, startLocal: formatLocal(block.start, user.prefs.timezone), minutes: block.minutes, calendarWritten: written });
     }
-    const out: CommitResult = { created, replaced, calendar: token && google ? "google" : "ics", errors };
-    out.icsFeedUrl = this.planFeedUrl(userId);
-    return out;
+    return { created, replaced, calendar: token && google ? "google" : "ics", errors };
   }
 
   planFeedIcs(userId: string): string {
@@ -485,12 +590,12 @@ export class Services {
       const p = planned.get(item.id);
       const touched = p || ["submitted", "graded", "done"].includes(item.status);
       if (!touched) continue;
-      const prior = this.store.getPrior(`${item.host ?? "local"}|${item.id}|${r.versionHash}`);
+      const prior = this.estimates.quickPrior(userId, item).estimate;
       const entry: { itemId: string; title: string; dueAt?: string; plannedMinutes: number; estimateP50: number } = {
         itemId: item.id,
         title: item.title,
         plannedMinutes: p?.minutes ?? 0,
-        estimateP50: prior?.p50Hours ?? 0,
+        estimateP50: prior.p50Hours,
       };
       if (item.dueAt) entry.dueAt = item.dueAt;
       out.push(entry);
@@ -502,6 +607,17 @@ export class Services {
 
   setPreferences(userId: string, patch: Partial<Preferences>): Preferences {
     if (patch.timezone && !isValidTimeZone(patch.timezone)) throw new Error(`unknown time zone ${patch.timezone}`);
+    if (patch.assistantUrl !== undefined) {
+      let u: URL | undefined;
+      try {
+        u = new URL(patch.assistantUrl);
+      } catch {
+        u = undefined;
+      }
+      // The extension opens this in a tab: https only, never javascript:, data: or file:.
+      if (!u || u.protocol !== "https:" || u.username || u.password) throw new Error("the assistant URL must be an https:// address");
+      patch = { ...patch, assistantUrl: u.toString().replace("%7Bq%7D", "{q}") };
+    }
     return this.store.updatePrefs(userId, patch);
   }
 

@@ -6,6 +6,7 @@ import { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
 import type { Actual, Course, Estimate, Preferences, StudyBlock, WorkItem, BlockStatus } from "../types.js";
 import { DEFAULT_PREFERENCES } from "../types.js";
+import { PAIRING_LOOKUP_LENGTH, hashToken, normalisePairingCode, safeEqual } from "../crypto.js";
 
 export const SCHEMA = `
 PRAGMA journal_mode = WAL;
@@ -30,6 +31,8 @@ CREATE TABLE IF NOT EXISTS canvas_accounts (
   last_sync_at TEXT,
   last_error TEXT,
   created_at TEXT NOT NULL,
+  failures INTEGER NOT NULL DEFAULT 0,
+  verified_at TEXT,
   UNIQUE (user_id, base_url, kind)
 );
 
@@ -102,7 +105,9 @@ CREATE TABLE IF NOT EXISTS devices (
 CREATE TABLE IF NOT EXISTS pairing_codes (
   code TEXT PRIMARY KEY,
   user_id TEXT NOT NULL,
-  expires_at TEXT NOT NULL
+  expires_at TEXT NOT NULL,
+  lookup TEXT,
+  attempts INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS connector_keys (
@@ -111,7 +116,8 @@ CREATE TABLE IF NOT EXISTS connector_keys (
   token_hash TEXT NOT NULL UNIQUE,
   label TEXT,
   created_at TEXT NOT NULL,
-  last_used_at TEXT
+  last_used_at TEXT,
+  expires_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS google_accounts (
@@ -151,20 +157,30 @@ CREATE TABLE IF NOT EXISTS oauth_tokens (
   resource TEXT,
   expires_at TEXT NOT NULL,
   created_at TEXT NOT NULL,
-  family TEXT NOT NULL
+  family TEXT NOT NULL,
+  used_at TEXT,
+  family_expires_at TEXT
 );
 CREATE INDEX IF NOT EXISTS oauth_tokens_family ON oauth_tokens (family);
 
 CREATE TABLE IF NOT EXISTS login_sessions (
   id TEXT PRIMARY KEY,
   user_id TEXT NOT NULL,
-  expires_at TEXT NOT NULL
+  expires_at TEXT NOT NULL,
+  idle_expires_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS pending_logins (
   id TEXT PRIMARY KEY,
   json TEXT NOT NULL,
   expires_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS feed_tokens (
+  user_id TEXT PRIMARY KEY,
+  token_hash TEXT NOT NULL UNIQUE,
+  token_sealed TEXT NOT NULL,
+  created_at TEXT NOT NULL
 );
 `;
 
@@ -186,6 +202,10 @@ export interface CanvasAccount {
   lastSyncAt: string | null;
   lastError: string | null;
   createdAt: string;
+  /** Consecutive failed syncs; the jobs back off on it. */
+  failures: number;
+  /** First successful sync: proof the student really reads this Canvas with this credential. */
+  verifiedAt: string | null;
 }
 
 export interface ItemRow {
@@ -226,6 +246,18 @@ export interface OAuthTokenRow {
   resource: string | null;
   expiresAt: string;
   family: string;
+  /** Refresh tokens are kept after rotation as tombstones; a second use revokes the family. */
+  usedAt?: string | null;
+  /** Absolute end of the grant; rotation never extends it. */
+  familyExpiresAt?: string | null;
+}
+
+export interface OAuthGrant {
+  family: string;
+  clientId: string;
+  createdAt: string;
+  lastUsedAt: string;
+  familyExpiresAt: string | null;
 }
 
 export interface ActualSample {
@@ -238,18 +270,30 @@ export interface ActualSample {
 
 type Row = Record<string, unknown>;
 
+/** Wrong guesses at one pairing code's lookup before the code is thrown away. */
+export const MAX_PAIRING_ATTEMPTS = 5;
+
 export function now(): string {
   return new Date().toISOString();
 }
 
+/**
+ * Every field the heuristic or the model prompt reads, so a shared prior can
+ * only ever be reused for an item with exactly the same content.
+ */
 export function itemVersionHash(item: WorkItem, hash: (s: string) => string): string {
   return hash(
     JSON.stringify([
       item.kind,
+      item.canvasType ?? null,
       item.title,
+      item.courseCode ?? null,
+      item.courseName ?? null,
       item.descriptionText ?? "",
+      item.descriptionChars ?? null,
       item.pointsPossible ?? null,
       item.submissionTypes ?? null,
+      item.allowedAttempts ?? null,
       item.rubricCriteria ?? null,
       item.quiz ?? null,
       item.peerReviews ?? null,
@@ -264,6 +308,64 @@ export class Store {
   constructor(path = ":memory:") {
     this.db = new DatabaseSync(path);
     this.db.exec(SCHEMA);
+    // CREATE TABLE IF NOT EXISTS leaves an older file's tables as they were; add what later versions need.
+    this.ensureColumn("connector_keys", "expires_at", "TEXT");
+    this.ensureColumn("oauth_tokens", "used_at", "TEXT");
+    this.ensureColumn("oauth_tokens", "family_expires_at", "TEXT");
+    this.ensureColumn("login_sessions", "idle_expires_at", "TEXT");
+    this.ensureColumn("canvas_accounts", "failures", "INTEGER NOT NULL DEFAULT 0");
+    this.ensureColumn("canvas_accounts", "verified_at", "TEXT");
+    this.ensureColumn("pairing_codes", "lookup", "TEXT");
+    this.ensureColumn("pairing_codes", "attempts", "INTEGER NOT NULL DEFAULT 0");
+  }
+
+  private txDepth = 0;
+
+  /**
+   * Runs `fn` in one transaction (a savepoint when nested) and returns its
+   * result. `fn` must be synchronous: the connection is shared by every
+   * request, so a transaction must never stay open across an await.
+   */
+  transaction<T>(fn: () => T): T {
+    const depth = this.txDepth;
+    const sp = `sp${depth}`;
+    this.db.exec(depth === 0 ? "BEGIN IMMEDIATE" : `SAVEPOINT ${sp}`);
+    this.txDepth = depth + 1;
+    try {
+      const out = fn();
+      if (out && typeof (out as { then?: unknown }).then === "function") throw new Error("Store.transaction needs a synchronous function");
+      this.db.exec(depth === 0 ? "COMMIT" : `RELEASE ${sp}`);
+      return out;
+    } catch (e) {
+      try {
+        this.db.exec(depth === 0 ? "ROLLBACK" : `ROLLBACK TO ${sp}; RELEASE ${sp}`);
+      } catch {
+        // already rolled back by SQLite
+      }
+      throw e;
+    } finally {
+      this.txDepth = depth;
+    }
+  }
+
+  /** Everything stored for one student, in one transaction: every table with a user_id column, then the user. */
+  deleteUserData(userId: string): void {
+    this.transaction(() => {
+      const tables = this.db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'").all() as Row[];
+      for (const t of tables) {
+        const name = String(t["name"]).replace(/"/g, '""');
+        if (name === "users") continue;
+        const cols = this.db.prepare(`PRAGMA table_info("${name}")`).all() as Row[];
+        if (cols.some((c) => c["name"] === "user_id")) this.db.prepare(`DELETE FROM "${name}" WHERE user_id = ?`).run(userId);
+      }
+      this.db.prepare("DELETE FROM users WHERE id = ?").run(userId);
+    });
+  }
+
+  /** Adds a column to an existing table unless it is already there. Names are code constants, never input. */
+  private ensureColumn(table: string, column: string, ddl: string): void {
+    const cols = this.db.prepare(`PRAGMA table_info(${table})`).all() as Row[];
+    if (!cols.some((c) => c["name"] === column)) this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${ddl}`);
   }
 
   close(): void {
@@ -318,7 +420,7 @@ export class Store {
       .get(a.userId, a.baseUrl, a.kind) as Row | undefined;
     if (existing) {
       this.db
-        .prepare("UPDATE canvas_accounts SET secret_sealed = COALESCE(?, secret_sealed), label = COALESCE(?, label), last_error = NULL WHERE id = ?")
+        .prepare("UPDATE canvas_accounts SET secret_sealed = COALESCE(?, secret_sealed), label = COALESCE(?, label), last_error = NULL, failures = 0 WHERE id = ?")
         .run(a.secretSealed ?? null, a.label ?? null, existing["id"] as string);
       return this.getCanvasAccount(existing["id"] as string)!;
     }
@@ -346,8 +448,17 @@ export class Store {
     this.db.prepare("DELETE FROM canvas_accounts WHERE user_id = ? AND id = ?").run(userId, id);
   }
 
-  markSync(id: string, error: string | null): void {
-    this.db.prepare("UPDATE canvas_accounts SET last_sync_at = ?, last_error = ? WHERE id = ?").run(now(), error, id);
+  /** `ok` false counts a failed sync (backoff); true resets the count and marks the account verified. Partial errors can still be ok. */
+  markSync(id: string, error: string | null, ok = error === null): void {
+    const ts = now();
+    this.db
+      .prepare(
+        `UPDATE canvas_accounts SET last_sync_at = ?, last_error = ?,
+           failures = CASE WHEN ? = 1 THEN 0 ELSE failures + 1 END,
+           verified_at = CASE WHEN ? = 1 THEN COALESCE(verified_at, ?) ELSE verified_at END
+         WHERE id = ?`,
+      )
+      .run(ts, error, ok ? 1 : 0, ok ? 1 : 0, ts, id);
   }
 
   // ---- courses --------------------------------------------------------
@@ -451,10 +562,20 @@ export class Store {
     };
   }
 
-  /** Median minutes other students logged for the same item, if at least `minN` did. */
+  /**
+   * Median minutes students logged for the same item, if at least `minN` did.
+   * Only students who have synced that Canvas with a token or its feed count:
+   * a host named only in an extension snapshot proves nothing.
+   */
   pooledActual(host: string, itemId: string, minN = 5): { medianMinutes: number; n: number } | undefined {
     const rows = this.db
-      .prepare("SELECT user_id, MAX(minutes) AS minutes FROM actuals WHERE host = ? AND item_id = ? GROUP BY user_id")
+      .prepare(
+        `SELECT a.user_id, MAX(a.minutes) AS minutes FROM actuals a
+         WHERE a.host = ? AND a.item_id = ?
+           AND EXISTS (SELECT 1 FROM canvas_accounts c WHERE c.user_id = a.user_id AND c.kind IN ('token','feed')
+                       AND c.verified_at IS NOT NULL AND c.base_url IN ('https://' || a.host, 'http://' || a.host))
+         GROUP BY a.user_id`,
+      )
       .all(host, itemId) as Row[];
     if (rows.length < minN) return undefined;
     const sorted = rows.map((r) => r["minutes"] as number).sort((a, b) => a - b);
@@ -506,18 +627,58 @@ export class Store {
 
   // ---- devices and pairing --------------------------------------------
 
+  /**
+   * Stores a code from `pairingCode()` hashed. Its first characters are kept as
+   * a lookup so wrong guesses can be counted against the code they aim at.
+   */
   createPairingCode(userId: string, code: string, ttlMinutes = 15): void {
+    const norm = normalisePairingCode(code);
+    if (!norm) throw new Error("not a pairing code");
     this.db.prepare("DELETE FROM pairing_codes WHERE user_id = ? OR expires_at < ?").run(userId, now());
     this.db
-      .prepare("INSERT INTO pairing_codes (code, user_id, expires_at) VALUES (?, ?, ?)")
-      .run(code, userId, new Date(Date.now() + ttlMinutes * 60_000).toISOString());
+      .prepare("INSERT INTO pairing_codes (code, user_id, expires_at, lookup, attempts) VALUES (?, ?, ?, ?, 0)")
+      .run(hashToken(norm), userId, new Date(Date.now() + ttlMinutes * 60_000).toISOString(), norm.slice(0, PAIRING_LOOKUP_LENGTH));
   }
 
+  /** One use. A code that takes MAX_PAIRING_ATTEMPTS wrong guesses at its lookup is deleted. */
   redeemPairingCode(code: string): string | undefined {
-    const r = this.db.prepare("SELECT * FROM pairing_codes WHERE code = ? AND expires_at > ?").get(code.toUpperCase(), now()) as Row | undefined;
-    if (!r) return undefined;
-    this.db.prepare("DELETE FROM pairing_codes WHERE code = ?").run(code.toUpperCase());
-    return r["user_id"] as string;
+    const norm = normalisePairingCode(code);
+    if (!norm) return undefined;
+    const lookup = norm.slice(0, PAIRING_LOOKUP_LENGTH);
+    const hash = hashToken(norm);
+    const rows = this.db.prepare("SELECT code, user_id FROM pairing_codes WHERE lookup = ? AND expires_at > ?").all(lookup, now()) as Row[];
+    const hit = rows.find((r) => safeEqual(String(r["code"]), hash));
+    if (hit) {
+      this.db.prepare("DELETE FROM pairing_codes WHERE code = ?").run(hash);
+      return hit["user_id"] as string;
+    }
+    if (rows.length) {
+      this.db.prepare("UPDATE pairing_codes SET attempts = attempts + 1 WHERE lookup = ?").run(lookup);
+      this.db.prepare("DELETE FROM pairing_codes WHERE lookup = ? AND attempts >= ?").run(lookup, MAX_PAIRING_ATTEMPTS);
+    }
+    return undefined;
+  }
+
+  // ---- plan feed tokens (random, stored hashed for lookup and sealed for display) --
+
+  getFeedTokenSealed(userId: string): string | undefined {
+    const r = this.db.prepare("SELECT token_sealed FROM feed_tokens WHERE user_id = ?").get(userId) as Row | undefined;
+    return r ? (r["token_sealed"] as string) : undefined;
+  }
+
+  /** Replaces the student's feed token; the old URL stops working at once. */
+  putFeedToken(userId: string, tokenHash: string, tokenSealed: string): void {
+    this.db
+      .prepare(
+        `INSERT INTO feed_tokens (user_id, token_hash, token_sealed, created_at) VALUES (?, ?, ?, ?)
+         ON CONFLICT(user_id) DO UPDATE SET token_hash = excluded.token_hash, token_sealed = excluded.token_sealed, created_at = excluded.created_at`,
+      )
+      .run(userId, tokenHash, tokenSealed, now());
+  }
+
+  userForFeedTokenHash(tokenHash: string): string | undefined {
+    const r = this.db.prepare("SELECT user_id FROM feed_tokens WHERE token_hash = ?").get(tokenHash) as Row | undefined;
+    return r ? (r["user_id"] as string) : undefined;
   }
 
   createDevice(userId: string, tokenHash: string, name: string | null): string {
@@ -572,6 +733,21 @@ export class Store {
 
   deleteConnectorKey(userId: string, id: string): void {
     this.db.prepare("DELETE FROM connector_keys WHERE user_id = ? AND id = ?").run(userId, id);
+  }
+
+  /** The key row behind a hash, without touching last_used_at; the caller checks expiry. */
+  getConnectorKeyByHash(tokenHash: string): { id: string; userId: string; expiresAt: string | null } | undefined {
+    const r = this.db.prepare("SELECT id, user_id, expires_at FROM connector_keys WHERE token_hash = ?").get(tokenHash) as Row | undefined;
+    return r ? { id: r["id"] as string, userId: r["user_id"] as string, expiresAt: (r["expires_at"] as string | null) ?? null } : undefined;
+  }
+
+  setConnectorKeyExpiry(userId: string, id: string, expiresAt: string | null): void {
+    this.db.prepare("UPDATE connector_keys SET expires_at = ? WHERE user_id = ? AND id = ?").run(expiresAt, userId, id);
+  }
+
+  listConnectorKeyExpiries(userId: string): Map<string, string | null> {
+    const rows = this.db.prepare("SELECT id, expires_at FROM connector_keys WHERE user_id = ?").all(userId) as Row[];
+    return new Map(rows.map((r) => [r["id"] as string, (r["expires_at"] as string | null) ?? null]));
   }
 
   // ---- google ---------------------------------------------------------
@@ -658,8 +834,41 @@ export class Store {
 
   putOAuthToken(row: OAuthTokenRow): void {
     this.db
-      .prepare("INSERT INTO oauth_tokens (token_hash, kind, client_id, user_id, scope, resource, expires_at, created_at, family) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
-      .run(row.tokenHash, row.kind, row.clientId, row.userId, row.scope, row.resource, row.expiresAt, now(), row.family);
+      .prepare("INSERT INTO oauth_tokens (token_hash, kind, client_id, user_id, scope, resource, expires_at, created_at, family, family_expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+      .run(row.tokenHash, row.kind, row.clientId, row.userId, row.scope, row.resource, row.expiresAt, now(), row.family, row.familyExpiresAt ?? null);
+  }
+
+  /** Marks a refresh token used. False when it already was: the caller treats that as reuse. */
+  markOAuthTokenUsed(tokenHash: string): boolean {
+    const r = this.db.prepare("UPDATE oauth_tokens SET used_at = ? WHERE token_hash = ? AND used_at IS NULL").run(now(), tokenHash);
+    return Number(r.changes) === 1;
+  }
+
+  deleteOAuthAccessTokens(family: string): void {
+    this.db.prepare("DELETE FROM oauth_tokens WHERE family = ? AND kind = 'access'").run(family);
+  }
+
+  /** One row per live grant (token family) of this user, for the settings page. */
+  listOAuthGrants(userId: string): OAuthGrant[] {
+    const rows = this.db
+      .prepare(
+        `SELECT family, client_id, MIN(created_at) AS created_at, MAX(created_at) AS last_used_at, MAX(family_expires_at) AS family_expires_at
+         FROM oauth_tokens WHERE user_id = ? GROUP BY family, client_id
+         HAVING SUM(CASE WHEN used_at IS NULL AND expires_at > ? THEN 1 ELSE 0 END) > 0
+         ORDER BY created_at`,
+      )
+      .all(userId, now()) as Row[];
+    return rows.map((r) => ({
+      family: r["family"] as string,
+      clientId: r["client_id"] as string,
+      createdAt: r["created_at"] as string,
+      lastUsedAt: r["last_used_at"] as string,
+      familyExpiresAt: (r["family_expires_at"] as string | null) ?? null,
+    }));
+  }
+
+  deleteOAuthFamilyForUser(userId: string, family: string): void {
+    this.db.prepare("DELETE FROM oauth_tokens WHERE user_id = ? AND family = ?").run(userId, family);
   }
 
   getOAuthToken(tokenHash: string): OAuthTokenRow | undefined {
@@ -674,6 +883,8 @@ export class Store {
       resource: (r["resource"] as string | null) ?? null,
       expiresAt: r["expires_at"] as string,
       family: r["family"] as string,
+      usedAt: (r["used_at"] as string | null) ?? null,
+      familyExpiresAt: (r["family_expires_at"] as string | null) ?? null,
     };
   }
 
@@ -696,15 +907,27 @@ export class Store {
 
   // ---- login sessions (settings page) ---------------------------------
 
-  createLoginSession(userId: string, id: string, ttlDays = 30): void {
+  /** `id` is whatever the caller keys sessions by (the server passes a hash of the cookie). */
+  createLoginSession(userId: string, id: string, ttlDays = 30, idleMinutes?: number): void {
+    const idle = idleMinutes ? new Date(Date.now() + idleMinutes * 60_000).toISOString() : null;
     this.db
-      .prepare("INSERT INTO login_sessions (id, user_id, expires_at) VALUES (?, ?, ?)")
-      .run(id, userId, new Date(Date.now() + ttlDays * 86_400_000).toISOString());
+      .prepare("INSERT INTO login_sessions (id, user_id, expires_at, idle_expires_at) VALUES (?, ?, ?, ?)")
+      .run(id, userId, new Date(Date.now() + ttlDays * 86_400_000).toISOString(), idle);
   }
 
-  userForLoginSession(id: string): string | undefined {
-    const r = this.db.prepare("SELECT user_id FROM login_sessions WHERE id = ? AND expires_at > ?").get(id, now()) as Row | undefined;
-    return r ? (r["user_id"] as string) : undefined;
+  /** With `idleMinutes`, a session unused for that long is over, and each use pushes the idle deadline out. */
+  userForLoginSession(id: string, idleMinutes?: number): string | undefined {
+    const ts = now();
+    const r = this.db
+      .prepare("SELECT user_id, idle_expires_at FROM login_sessions WHERE id = ? AND expires_at > ? AND (idle_expires_at IS NULL OR idle_expires_at > ?)")
+      .get(id, ts, ts) as Row | undefined;
+    if (!r) return undefined;
+    if (idleMinutes) {
+      const next = Date.now() + idleMinutes * 60_000;
+      const current = r["idle_expires_at"] ? Date.parse(r["idle_expires_at"] as string) : 0;
+      if (next - current > 60_000) this.db.prepare("UPDATE login_sessions SET idle_expires_at = ? WHERE id = ?").run(new Date(next).toISOString(), id);
+    }
+    return r["user_id"] as string;
   }
 
   deleteLoginSession(id: string): void {
@@ -751,6 +974,8 @@ function rowToAccount(r: Row): CanvasAccount {
     lastSyncAt: (r["last_sync_at"] as string | null) ?? null,
     lastError: (r["last_error"] as string | null) ?? null,
     createdAt: r["created_at"] as string,
+    failures: Number(r["failures"] ?? 0),
+    verifiedAt: (r["verified_at"] as string | null) ?? null,
   };
 }
 

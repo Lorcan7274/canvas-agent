@@ -1,0 +1,18 @@
+# Never bake local state or secrets into the image.
+.git
+.github
+.env
+.env.*
+!.env.example
+data
+*.sqlite
+*.sqlite-*
+*.db
+# Built inside the image, from a clean install.
+node_modules
+**/node_modules
+**/dist
+**/*.tsbuildinfo
+apps/extension/build
+coverage
+*.log

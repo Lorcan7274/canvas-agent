@@ -39,7 +39,7 @@ Then:
    - **Browser extension** (full details, no token): `pnpm --filter @canvas-agent/extension build`, load `apps/extension/build` unpacked in Chrome, open its options, paste the server URL and a pairing code from the settings page. It syncs whenever you have Canvas open.
 3. **Connect your assistant.** The MCP URL is `<server>/mcp`.
    - **Claude Code** (works with localhost): `claude mcp add --transport http planner http://localhost:8787/mcp --header "Authorization: Bearer ck_…"` using a connector key from the settings page.
-   - **claude.ai / Claude Desktop / ChatGPT**: these connect from the vendor's cloud, so the server needs a public HTTPS URL (deploy it, or expose it with a tunnel such as `cloudflared tunnel --url http://localhost:8787` and set `BASE_URL` to the tunnel URL). Add a custom connector with the `/mcp` URL and sign in when asked; the server is its own OAuth provider.
+   - **claude.ai / Claude Desktop / ChatGPT**: these connect from the vendor's cloud, so the server needs a public HTTPS URL (deploy it, or expose it with a tunnel such as `cloudflared tunnel --url http://localhost:8787` and set `BASE_URL` to the tunnel URL). An https `BASE_URL` counts as production, so dev login is refused there: configure Google sign-in (below) first, and do not set `ALLOW_DEV_LOGIN` on a public URL. Add a custom connector with the `/mcp` URL and sign in when asked; the server is its own OAuth provider.
 4. **Calendar.** Without Google configured, commit a plan and subscribe to the ICS feed shown on the settings page in any calendar app. With Google configured (below), blocks are written to your primary calendar and the planner reads your busy time.
 
 Try the prompts the connector ships: *Plan my week*, *What's due*, *Weekly check-in*.
@@ -52,9 +52,11 @@ Environment variables (see `.env.example`; `node --env-file=.env …` loads them
 |---|---|---|
 | `PORT`, `HOST` | `8787`, `0.0.0.0` | Where to listen |
 | `BASE_URL` | `http://localhost:PORT` | Public origin. OAuth issuer, MCP resource, redirect URIs, feed URLs |
-| `SECRET_KEY` | dev value, required in production | Seals Canvas tokens, feed URLs and Google tokens at rest; signs CSRF |
+| `SECRET_KEY` | dev value locally; required in production | Seals Canvas tokens, feed URLs and Google tokens at rest; signs CSRF. In production (`NODE_ENV=production` or an https `BASE_URL`) it must be 32+ characters and not a placeholder: `openssl rand -base64 48` |
 | `DB_PATH` | `./data/canvas-agent.sqlite` | SQLite file (`:memory:` for throwaway) |
-| `AUTH_MODE` | `google` when Google is configured, else `dev` | `dev` = email-only login form. Never expose `dev` publicly |
+| `AUTH_MODE` | `google` when Google is configured, else `dev` | `dev` = email-only login form; the server refuses to start with it in production |
+| `ALLOW_DEV_LOGIN` | off | `1` allows dev login in production, for a private test deployment only: anyone who can reach it can sign in as any non-Google account |
+| `ALLOWED_HOSTS` | loopback names when `BASE_URL` is localhost, else any | Comma-separated `Host` headers the server answers |
 | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | | Sign in with Google + Calendar. Redirect URI: `BASE_URL/oauth/google/callback`. Scopes: `calendar.events`, `calendar.freebusy` (sensitive; under 100 users Google's "testing" mode needs no verification) |
 | `ANTHROPIC_API_KEY`, `USE_LLM` | heuristic only | With a key, each new assignment gets one Claude task card (steps, quantities, p50/p80), shared by everyone who has that assignment |
 | `SYNC_INTERVAL_MINUTES` | `30` | Token and feed re-sync cadence |
@@ -86,14 +88,14 @@ p80 is used automatically for anything due within 72 hours.
 
 ## Deploying
 
-`Dockerfile` builds a single image: `docker build -t canvas-agent . && docker run -p 8787:8787 -v canvas-data:/data -e BASE_URL=https://planner.example.com -e SECRET_KEY=… canvas-agent`. Any host that runs a container with a persistent volume works (Fly, Railway, a VPS behind Caddy). Put it behind HTTPS; the OAuth flows require it.
+`Dockerfile` builds a single image: `docker build -t canvas-agent . && docker run -p 8787:8787 -v canvas-data:/data -e BASE_URL=https://planner.example.com -e SECRET_KEY=… -e GOOGLE_CLIENT_ID=… -e GOOGLE_CLIENT_SECRET=… canvas-agent`. Production needs Google sign-in (or `ALLOW_DEV_LOGIN=1` for a private test). Without Docker: `pnpm install && pnpm build && node --env-file=.env apps/server/dist/main.js`. Any host that runs a container with a persistent volume works (Fly, Railway, a VPS behind Caddy). Put it behind HTTPS; the OAuth flows require it.
 
 ## Privacy and safety
 
 - The server only ever **reads** Canvas. The extension sends GET requests with your session; it never submits, posts or messages.
 - Canvas tokens, feed URLs and Google tokens are sealed with AES-256-GCM under `SECRET_KEY`. Connector keys, device tokens and OAuth tokens are stored hashed.
 - Nothing from one student's account is visible to another; pooled estimates are medians over at least five students.
-- Delete everything from the settings page (remove accounts, revoke keys, disconnect Google) or by deleting the SQLite file.
+- Delete everything from the settings page (remove accounts, revoke keys, disconnect assistants and Google) or by deleting the SQLite file.
 - Your school's acceptable-use policy applies to you. Some schools forbid third-party tools reading Canvas; check before you connect.
 
 ## Development
@@ -101,6 +103,7 @@ p80 is used automatically for anything due within 72 hours.
 ```bash
 pnpm check                          # typecheck + vitest
 pnpm stub                           # fake Canvas on :3999 (token stub-token, feed URL printed)
+EGRESS_ALLOW_LOOPBACK=1 pnpm dev    # needed to point the server at the stub: outbound requests to loopback are refused otherwise
 pnpm dev                            # server with tsx watch
 pnpm --filter @canvas-agent/extension build
 ```

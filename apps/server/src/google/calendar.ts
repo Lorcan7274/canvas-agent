@@ -1,8 +1,12 @@
 /**
  * Google Calendar over plain fetch: token refresh, free/busy, and the events
  * we own (tagged with a private extended property so they can be found again).
+ * Requests go through the egress guard (timeout, size cap, no redirects);
+ * errors carry the status code only, never Google's response body.
  */
-import type { Interval } from "@canvas-agent/core";
+import { EgressError, safeFetcher, type Interval } from "@canvas-agent/core";
+
+const googleFetch = safeFetcher({ timeoutMs: 15_000, maxBytes: 2 * 1024 * 1024 });
 
 export const GOOGLE_SCOPES = [
   "openid",
@@ -31,6 +35,11 @@ export class GoogleError extends Error {
   }
 }
 
+/** Safe to show or log: our own errors carry a status code at most; anything else (a JSON.parse message quoting the body) is replaced. */
+export function googleErrorMessage(e: unknown): string {
+  return e instanceof GoogleError || e instanceof EgressError ? e.message : "Google Calendar did not answer as expected";
+}
+
 export interface GoogleEvent {
   id: string;
   status?: string;
@@ -44,10 +53,11 @@ export class GoogleCalendar {
   constructor(
     private readonly clientId: string,
     private readonly clientSecret: string,
-    private readonly fetchImpl: typeof fetch = fetch,
+    private readonly fetchImpl: typeof fetch = googleFetch,
   ) {}
 
-  authUrl(redirectUri: string, state: string, scopes: string[] = GOOGLE_SCOPES): string {
+  /** `codeChallenge`: an S256 PKCE challenge; pass its verifier to `exchangeCode`. */
+  authUrl(redirectUri: string, state: string, scopes: string[] = GOOGLE_SCOPES, codeChallenge?: string): string {
     const u = new URL("https://accounts.google.com/o/oauth2/v2/auth");
     u.searchParams.set("client_id", this.clientId);
     u.searchParams.set("redirect_uri", redirectUri);
@@ -57,11 +67,15 @@ export class GoogleCalendar {
     u.searchParams.set("prompt", "consent");
     u.searchParams.set("include_granted_scopes", "true");
     u.searchParams.set("state", state);
+    if (codeChallenge) {
+      u.searchParams.set("code_challenge", codeChallenge);
+      u.searchParams.set("code_challenge_method", "S256");
+    }
     return u.toString();
   }
 
-  async exchangeCode(code: string, redirectUri: string): Promise<GoogleTokens> {
-    return this.tokenRequest({ code, redirect_uri: redirectUri, grant_type: "authorization_code" });
+  async exchangeCode(code: string, redirectUri: string, codeVerifier?: string): Promise<GoogleTokens> {
+    return this.tokenRequest({ code, redirect_uri: redirectUri, grant_type: "authorization_code", ...(codeVerifier ? { code_verifier: codeVerifier } : {}) });
   }
 
   async refresh(refreshToken: string): Promise<GoogleTokens> {
@@ -90,7 +104,7 @@ export class GoogleCalendar {
     if (body !== undefined) init.body = JSON.stringify(body);
     const res = await this.fetchImpl(`https://www.googleapis.com/calendar/v3${path}`, init);
     if (res.status === 204) return undefined as T;
-    if (!res.ok) throw new GoogleError(`calendar ${method} ${path} ${res.status}: ${(await res.text()).slice(0, 200)}`, res.status);
+    if (!res.ok) throw new GoogleError(`Google Calendar returned ${res.status}`, res.status);
     return (await res.json()) as T;
   }
 

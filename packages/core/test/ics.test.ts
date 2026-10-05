@@ -65,3 +65,25 @@ describe("writeIcs", () => {
     expect(ev?.end).toBe("2026-10-07T22:30:00.000Z");
   });
 });
+
+describe("ICS safety", () => {
+  it("escapes a lone CR so it cannot start a new property", () => {
+    const ics = writeIcs("x", [{ uid: "u1", start: "2026-10-01T10:00:00Z", end: "2026-10-01T11:00:00Z", summary: "a\rX-INJECTED:1", description: "b\rATTENDEE:mailto:x@y" }]);
+    expect(ics).not.toMatch(/\r(?!\n)/);
+    expect(ics.split("\r\n").some((l) => l.startsWith("X-INJECTED") || l.startsWith("ATTENDEE"))).toBe(false);
+  });
+  it("writes only http(s) URLs, canonicalised so CR/LF cannot inject lines", () => {
+    const bad = writeIcs("x", [{ uid: "u1", start: "2026-10-01T10:00:00Z", end: "2026-10-01T11:00:00Z", summary: "s", url: "javascript:alert(1)" }]);
+    expect(bad).not.toContain("URL:");
+    const crlf = writeIcs("x", [{ uid: "u1", start: "2026-10-01T10:00:00Z", end: "2026-10-01T11:00:00Z", summary: "s", url: "https://canvas.example.edu/a\r\nX-INJECTED:1" }]);
+    expect(crlf.split("\r\n").some((l) => l.startsWith("X-INJECTED"))).toBe(false);
+  });
+  it("ignores non-http URLs in a Canvas feed", () => {
+    const [ev] = parseIcs(FEED.replace("URL:https://canvas.example.edu/courses/101/assignments/1002", "URL:javascript:alert(1)"));
+    expect(canvasFeedEventToItem(ev!, "2026-10-01T00:00:00Z")?.url).toBeUndefined();
+  });
+  it("never splits a surrogate pair when folding", () => {
+    const ics = writeIcs("x", [{ uid: "u1", start: "2026-10-01T10:00:00Z", end: "2026-10-01T11:00:00Z", summary: "a".repeat(63) + "😀".repeat(20) }]);
+    for (const line of ics.split("\r\n")) expect(line).not.toMatch(/[\ud800-\udbff]$|^ ?[\udc00-\udfff]/);
+  });
+});

@@ -24,13 +24,41 @@ export async function saveSettings(patch: Partial<ExtensionSettings>): Promise<E
 
 export const PLAN_PROMPT = "Plan my week. Get my workload from the Canvas planner, ask me about any check-ins first, then propose study blocks around my calendar and show them by day. Wait for my OK before committing.";
 
+/** Only https URLs are ever opened; a custom URL that is anything else falls back to Claude. */
 export function assistantUrl(settings: ExtensionSettings, prompt = PLAN_PROMPT): string {
   const q = encodeURIComponent(prompt);
   if (settings.assistant === "chatgpt") return `https://chatgpt.com/?q=${q}`;
   if (settings.assistant === "custom" && settings.assistantUrl) {
-    return settings.assistantUrl.includes("{q}") ? settings.assistantUrl.replace("{q}", q) : settings.assistantUrl;
+    const url = settings.assistantUrl.includes("{q}") ? settings.assistantUrl.replace("{q}", q) : settings.assistantUrl;
+    try {
+      if (new URL(url).protocol === "https:") return url;
+    } catch {
+      // fall through
+    }
   }
   return `https://claude.ai/new?q=${q}`;
+}
+
+/**
+ * The planner server's origin, if it is one the device token may be sent to:
+ * https anywhere, plain http only on this computer.
+ */
+export function serverOrigin(raw: string): string | undefined {
+  try {
+    const u = new URL(raw);
+    if (u.username || u.password) return undefined;
+    if (u.protocol === "https:") return u.origin;
+    if (u.protocol === "http:" && (u.hostname === "localhost" || u.hostname === "127.0.0.1")) return u.origin;
+  } catch {
+    // not a URL
+  }
+  return undefined;
+}
+
+/** The host permission pattern for an origin; ports are not part of match patterns. */
+export function originPattern(origin: string): string {
+  const u = new URL(origin);
+  return `${u.protocol}//${u.hostname}/*`;
 }
 
 export type Message =

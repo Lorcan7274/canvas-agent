@@ -12,3 +12,5 @@ export * from "./estimate/service.js";
 export * from "./plan/planner.js";
 export * from "./store/db.js";
 export * from "./sync.js";
+export * from "./egress.js";
+export * from "./canvas/project.js";

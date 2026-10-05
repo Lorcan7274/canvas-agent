@@ -1,6 +1,6 @@
 /** JSON routes used by the browser extension. */
 import { Router, type Request, type Response, type NextFunction } from "express";
-import { hashToken, ingestSnapshot, type CanvasSnapshot } from "@canvas-agent/core";
+import { hashToken, ingestSnapshot, projectCanvasSnapshot, type CanvasSnapshot } from "@canvas-agent/core";
 import type { Services } from "../services.js";
 
 declare module "express-serve-static-core" {
@@ -23,8 +23,34 @@ export function requireDevice(services: Services) {
   };
 }
 
+/** chrome-extension://<id>, moz-extension://<uuid>, safari-web-extension://<uuid>. */
+const EXTENSION_ORIGIN = /^(chrome-extension|moz-extension|safari-web-extension):\/\/[A-Za-z0-9-]{1,64}$/;
+
+/**
+ * CORS for the extension on /api/*: its pages and worker are cross-origin to
+ * this server. Bearer tokens only, no cookies, so no credentials are allowed.
+ * Exported so app.ts can mount it ahead of anything else on /api.
+ */
+export function extensionCors(req: Request, res: Response, next: NextFunction): void {
+  if (!req.path.startsWith("/api/")) return next();
+  const origin = req.headers.origin;
+  if (typeof origin === "string" && EXTENSION_ORIGIN.test(origin)) {
+    res.setHeader("access-control-allow-origin", origin);
+    res.setHeader("access-control-allow-methods", "GET, POST, OPTIONS");
+    res.setHeader("access-control-allow-headers", "authorization, content-type");
+    res.setHeader("access-control-max-age", "600");
+  }
+  res.vary("Origin");
+  if (req.method === "OPTIONS") {
+    res.status(204).end();
+    return;
+  }
+  next();
+}
+
 export function apiRoutes(services: Services): Router {
   const r = Router();
+  r.use(extensionCors);
 
   r.get("/healthz", (_req, res) => {
     res.json({ ok: true, name: "canvas-agent", time: new Date().toISOString() });
@@ -32,7 +58,7 @@ export function apiRoutes(services: Services): Router {
 
   r.post("/api/pair", (req, res) => {
     const body = req.body as { code?: string; name?: string };
-    const code = String(body?.code ?? "").trim();
+    const code = String(body?.code ?? "").trim().slice(0, 64);
     if (!code) {
       res.status(400).json({ error: "code required" });
       return;
@@ -53,25 +79,33 @@ export function apiRoutes(services: Services): Router {
       name: user.name,
       assistant: user.prefs.assistant,
       assistantUrl: user.prefs.assistantUrl ?? null,
-      planFeedUrl: services.planFeedUrl(user.id),
       accounts: services.store.listCanvasAccounts(user.id).map((a) => ({ baseUrl: a.baseUrl, kind: a.kind, lastSyncAt: a.lastSyncAt })),
     });
   });
 
+  // app.ts parses this body (after the device check); the projection below drops
+  // every field the normaliser does not read and caps every list and string.
   r.post("/api/ingest", requireDevice(services), (req, res) => {
-    const snap = req.body as CanvasSnapshot;
-    if (!snap || typeof snap.baseUrl !== "string" || !Array.isArray(snap.plannerItems)) {
+    const body = req.body as CanvasSnapshot | undefined;
+    if (!body || typeof body !== "object" || typeof body.baseUrl !== "string" || !Array.isArray(body.plannerItems)) {
       res.status(400).json({ error: "expected { baseUrl, fetchedAt, courses, plannerItems, assignments?, quizzes?, missingSubmissions? }" });
       return;
     }
     const userId = req.deviceUserId!;
+    let account;
     try {
-      const account = services.addSessionAccount(userId, snap.baseUrl);
-      const report = ingestSnapshot(services.store, userId, { ...snap, baseUrl: account.baseUrl, fetchedAt: snap.fetchedAt || new Date().toISOString() });
-      services.store.markSync(account.id, report.errors.length ? report.errors.join("; ") : null);
-      res.json({ ok: true, ...report });
+      account = services.addSessionAccount(userId, body.baseUrl);
     } catch (e) {
-      res.status(400).json({ error: (e as Error).message });
+      res.status(400).json({ error: (e as Error).message.slice(0, 200) });
+      return;
+    }
+    try {
+      const snap = projectCanvasSnapshot({ ...body, baseUrl: account.baseUrl });
+      const report = ingestSnapshot(services.store, userId, { ...snap, fetchedAt: snap.fetchedAt || new Date().toISOString() });
+      services.store.markSync(account.id, report.errors.length ? report.errors.join("; ").slice(0, 500) : null, true);
+      res.json({ ok: true, ...report });
+    } catch {
+      res.status(400).json({ error: "the snapshot could not be read" });
     }
   });
 

@@ -47,6 +47,9 @@ importers:
       express:
         specifier: ^5.1
         version: 5.2.1
+      express-rate-limit:
+        specifier: ^8.7
+        version: 8.7.0(express@5.2.1)
       zod:
         specifier: ^3.25
         version: 3.25.76

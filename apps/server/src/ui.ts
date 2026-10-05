@@ -1,4 +1,23 @@
 /** Tiny server-rendered HTML helpers. No framework, no client JS beyond a few lines. */
+import type { RequestHandler } from "express";
+
+/** Pages carry no script; inline styles only; nobody may frame them (clickjacking on consent). */
+export const PAGE_CSP = "default-src 'none'; style-src 'unsafe-inline'; img-src 'self' data:; base-uri 'none'; frame-ancestors 'none'";
+
+/** On every response: no sniffing, no framing, no Referer leaving with a URL. */
+export const securityHeaders: RequestHandler = (_req, res, next) => {
+  res.setHeader("x-content-type-options", "nosniff");
+  res.setHeader("referrer-policy", "no-referrer");
+  res.setHeader("x-frame-options", "DENY");
+  res.setHeader("content-security-policy", PAGE_CSP);
+  next();
+};
+
+/** On the HTML pages (settings, login, consent): they show secrets and per-user data, so never cache them. */
+export const noStore: RequestHandler = (_req, res, next) => {
+  res.setHeader("cache-control", "no-store");
+  next();
+};
 
 export function esc(s: unknown): string {
   return String(s ?? "")

@@ -12,6 +12,20 @@ describe("htmlToText", () => {
   it("handles numeric entities", () => {
     expect(htmlToText("a&#8211;b &#x27;c&#x27;")).toBe("a–b 'c'");
   });
+  it("leaves out-of-range code points alone instead of throwing", () => {
+    expect(htmlToText("x &#1114112; y &#x110000; z &#99999999999;")).toBe("x &#1114112; y &#x110000; z &#99999999999;");
+  });
+  it("stays linear on unclosed tags and blocks", () => {
+    // ~190k characters, all inside the 200k cap.
+    const nasty = "<a".repeat(30_000) + "<li".repeat(20_000) + "</p ".repeat(5_000) + "<script".repeat(10_000) + "x";
+    const t0 = Date.now();
+    htmlToText(nasty);
+    expect(Date.now() - t0).toBeLessThan(1000);
+  });
+  it("drops an unclosed script to the end and reads at most 200k characters", () => {
+    expect(htmlToText("keep<script>secret()")).toBe("keep");
+    expect(htmlToText("a".repeat(300_000)).length).toBe(200_000);
+  });
 });
 
 describe("extractQuantities", () => {

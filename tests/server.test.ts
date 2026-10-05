@@ -37,7 +37,7 @@ beforeAll(async () => {
   const store = new Store();
   const port = await freePort();
   base = `http://127.0.0.1:${port}`;
-  const config = loadConfig({ baseUrl: base, secretKey: "test-secret-key-0123456789", rateLimit: false, authMode: "dev", dbPath: ":memory:", useLlm: false });
+  const config = loadConfig({ baseUrl: base, secretKey: "test-secret-key-0123456789", rateLimit: false, authMode: "dev", dbPath: ":memory:", useLlm: false, allowLoopbackEgress: true });
   services = new Services(store, new Sealer(config.secretKey), config, new EstimateService(store));
   const app = createApp({ services, log: () => {} });
   http = await new Promise<Server>((resolve) => {
@@ -107,13 +107,15 @@ describe("MCP over a connector key", () => {
     expect(proposal.blocks.length).toBeGreaterThan(0);
 
     const first = proposal.blocks.slice(0, 2);
-    const commit = structured<{ created: Array<{ id: string; itemId: string }>; calendar: string; icsFeedUrl: string }>(
+    const commit = structured<{ created: Array<{ itemId: string }>; calendar: string }>(
       await client.callTool({ name: "commit_plan", arguments: { blocks: first.map((b) => ({ item_id: b.itemId, start: b.start, end: b.end })) } }),
     );
     expect(commit.created).toHaveLength(2);
     expect(commit.calendar).toBe("ics");
 
-    const ics = await fetch(commit.icsFeedUrl).then((r) => r.text());
+    // The feed link is a capability: it is on the settings page, never in a tool result.
+    expect(JSON.stringify(commit)).not.toContain("/feeds/plan/");
+    const ics = await fetch(services.planFeedUrl(userId)).then((r) => r.text());
     expect(parseIcs(ics)).toHaveLength(2);
     expect(parseIcs(ics)[0]?.summary).toMatch(/^Study: /);
 
@@ -245,8 +247,11 @@ describe("extension pairing and ingest", () => {
     const settings = await fetch(`${base}/`, { headers: { cookie: `sid=${sid}` } }).then((r) => r.text());
     const csrf = /name="csrf" value="([^"]+)"/.exec(settings)?.[1]!;
     const pair = await fetch(`${base}/settings/pair`, { method: "POST", redirect: "manual", headers: { "content-type": "application/x-www-form-urlencoded", cookie: `sid=${sid}` }, body: new URLSearchParams({ csrf }) });
-    const code = new URL(pair.headers.get("location")!, base).searchParams.get("secret")!;
-    expect(code).toMatch(/^[A-Z2-9]{6}$/);
+    // The code is shown once on the page, never carried in the redirect URL.
+    expect(pair.headers.get("location")).toBe("/");
+    const shown = await fetch(`${base}/`, { headers: { cookie: `sid=${sid}` } }).then((r) => r.text());
+    const code = /<pre>([A-Z2-9]{4}-[A-Z2-9]{4}-[A-Z2-9]{4})<\/pre>/.exec(shown)?.[1]!;
+    expect(code).toMatch(/^[A-Z2-9]{4}-[A-Z2-9]{4}-[A-Z2-9]{4}$/);
 
     const paired = await fetch(`${base}/api/pair`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ code, name: "Chrome on laptop" }) }).then((r) => r.json() as Promise<{ deviceToken: string }>);
     expect(paired.deviceToken).toMatch(/^dv_/);
