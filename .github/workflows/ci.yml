@@ -1,12 +1,22 @@
 name: ci
+# Pushes to main and pull requests; a PR branch is checked once, as a pull request.
 on:
   push:
+    branches: [main]
   pull_request:
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
   check:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: pnpm/action-setup@v4
         with:
           version: 10.28.0
@@ -15,6 +25,50 @@ jobs:
           node-version: 22
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      # Typecheck every package, then vitest: core, the server end to end, and the
+      # extension's worker (apps/extension/test), all against the stub Canvas.
       - run: pnpm check
-      - run: pnpm --filter @canvas-agent/extension build
-      - run: pnpm --filter @canvas-agent/core --filter @canvas-agent/server run build
+      # Every package's build, the extension's included (apps/extension/build, with its icons).
+      - run: pnpm build
+      - name: Extension package is complete
+        run: |
+          for f in manifest.json background.js content.js options.html options.js icons/icon-16.png icons/icon-128.png; do
+            test -s "apps/extension/build/$f" || { echo "missing apps/extension/build/$f"; exit 1; }
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: extension
+          path: apps/extension/build
+          retention-days: 14
+
+  docker:
+    needs: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Is there a Docker daemon?
+        id: docker
+        run: |
+          if docker info >/dev/null 2>&1; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::no Docker daemon on this runner; the image build is skipped"
+          fi
+      - name: Build the image
+        if: steps.docker.outputs.available == 'true'
+        run: docker build -t canvas-agent:ci .
+      # Production mode with a real key; dev login allowed only because nothing here is public.
+      - name: Smoke test
+        if: steps.docker.outputs.available == 'true'
+        run: |
+          docker run -d --name canvas-agent -p 8787:8787 -e SECRET_KEY="$(openssl rand -base64 48)" -e ALLOW_DEV_LOGIN=1 canvas-agent:ci
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:8787/healthz; then exit 0; fi
+            sleep 1
+          done
+          docker logs canvas-agent
+          exit 1

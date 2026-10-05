@@ -80,10 +80,28 @@ describe("MCP over a connector key", () => {
     const client = await mcpClient(connectorKey);
     const tools = await client.listTools();
     const names = tools.tools.map((t) => t.name).sort();
-    expect(names).toEqual(["clear_plan", "commit_plan", "get_assignment", "get_preferences", "get_profile", "get_workload", "log_time", "propose_plan", "set_preferences"]);
+    expect(names).toEqual(["clear_plan", "commit_plan", "get_assignment", "get_plan", "get_preferences", "get_profile", "get_workload", "log_time", "move_block", "propose_plan", "remove_blocks", "set_preferences"]);
+    // Both directories want every hint stated, not inferred from defaults.
+    const expected: Record<string, [readOnly: boolean, destructive: boolean, idempotent: boolean]> = {
+      get_workload: [true, false, true],
+      get_assignment: [true, false, true],
+      propose_plan: [true, false, true],
+      get_plan: [true, false, true],
+      get_preferences: [true, false, true],
+      get_profile: [true, false, true],
+      commit_plan: [false, false, true],
+      clear_plan: [false, true, true],
+      remove_blocks: [false, true, true],
+      move_block: [false, true, true],
+      log_time: [false, false, false],
+      set_preferences: [false, false, true],
+    };
     for (const t of tools.tools) {
       expect(t.title ?? t.annotations?.title, t.name).toBeTruthy();
-      expect(t.annotations?.readOnlyHint !== undefined || t.annotations?.destructiveHint !== undefined, t.name).toBe(true);
+      const a = t.annotations ?? {};
+      for (const hint of ["readOnlyHint", "destructiveHint", "idempotentHint", "openWorldHint"] as const) expect(typeof a[hint], `${t.name} ${hint}`).toBe("boolean");
+      expect([a.readOnlyHint, a.destructiveHint, a.idempotentHint], t.name).toEqual(expected[t.name]);
+      expect(a.openWorldHint, t.name).toBe(false);
     }
     const prompts = await client.listPrompts();
     expect(prompts.prompts.map((p) => p.name).sort()).toEqual(["plan_my_week", "weekly_checkin", "whats_due"]);
@@ -123,12 +141,20 @@ describe("MCP over a connector key", () => {
     const planned = after.items.find((i) => i.id === first[0]!.itemId)!;
     expect(planned.plannedMinutes).toBeGreaterThan(0);
 
-    const logged = structured<{ minutes: number; blocksClosed: number }>(await client.callTool({ name: "log_time", arguments: { item_id: first[0]!.itemId, bucket: "2-4h" } }));
+    // The committed blocks are still ahead: logging finished work removes them rather than marking them done.
+    const logged = structured<{ minutes: number; blocksClosed: number; blocksRemoved: number }>(await client.callTool({ name: "log_time", arguments: { item_id: first[0]!.itemId, bucket: "2-4h" } }));
     expect(logged.minutes).toBe(180);
-    expect(logged.blocksClosed).toBeGreaterThanOrEqual(1);
+    expect(logged.blocksClosed).toBe(0);
+    expect(logged.blocksRemoved).toBe(first.filter((b) => b.itemId === first[0]!.itemId).length);
 
-    const cleared = structured<{ cleared: number }>(await client.callTool({ name: "clear_plan", arguments: {} }));
-    expect(cleared.cleared).toBeGreaterThanOrEqual(0);
+    // clear_plan removes exactly what is left of the plan from now on.
+    const left = first.filter((b) => b.itemId !== first[0]!.itemId).length;
+    const cleared = structured<{ cleared: number; failed: unknown[] }>(await client.callTool({ name: "clear_plan", arguments: {} }));
+    expect(cleared.cleared).toBe(left);
+    expect(cleared.failed).toEqual([]);
+    expect(parseIcs(await fetch(services.planFeedUrl(userId)).then((r) => r.text()))).toHaveLength(0);
+    const again = structured<{ cleared: number }>(await client.callTool({ name: "clear_plan", arguments: {} }));
+    expect(again.cleared).toBe(0);
 
     const prefs = structured<{ timezone: string }>(await client.callTool({ name: "set_preferences", arguments: { timezone: "Europe/Dublin", max_hours_per_day: 3 } }));
     expect(prefs.timezone).toBe("Europe/Dublin");

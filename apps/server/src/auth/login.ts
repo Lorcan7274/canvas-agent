@@ -189,8 +189,8 @@ export function loginRoutes(services: Services, provider: SqliteOAuthProvider): 
       return;
     }
     const existing = services.store.getUserByEmail(email);
-    // An account that signs in with Google is never reachable by typing its email.
-    if (existing && services.store.getGoogleAccount(existing.id)) {
+    // An account that signs in with Google is never reachable by typing its email, even after its calendar link is removed.
+    if (existing && (existing.signInProvider === "google" || services.store.getGoogleAccount(existing.id))) {
       res.status(403).type("text/plain").send("that account signs in with Google");
       return;
     }
@@ -262,7 +262,9 @@ export function loginRoutes(services: Services, provider: SqliteOAuthProvider): 
       verifierSealed: services.sealer.seal(verifier),
     });
     res.append("set-cookie", cookie(cfg, nonceCookieName(cfg), nonce, GOOGLE_NONCE_TTL_S));
-    res.redirect(services.google.authUrl(`${cfg.baseUrl}/oauth/google/callback`, state, GOOGLE_SCOPES, challenge));
+    // The consent screen is needed for a refresh token; skip it when one is already stored for this account.
+    const consent = !(req.loginUserId && services.store.getGoogleAccount(req.loginUserId));
+    res.redirect(services.google.authUrl(`${cfg.baseUrl}/oauth/google/callback`, state, GOOGLE_SCOPES, challenge, { consent }));
   });
 
   r.get("/oauth/google/callback", consentLimiter(cfg), async (req, res) => {
@@ -303,7 +305,16 @@ export function loginRoutes(services: Services, provider: SqliteOAuthProvider): 
       if (!userId) {
         if (!email) throw new Error("Google did not return an email");
         userId = (services.store.getUserByEmail(email) ?? services.store.createUser(email, info.name ?? null)).id;
+        services.store.setSignInProvider(userId, "google");
         setSession(services, req, res, userId);
+      }
+      // Google lets the student untick scopes; a half-granted calendar is stored as nothing, not as "connected".
+      const granted = new Set((tokens.scope ?? "").split(" "));
+      const calendarGranted = GOOGLE_SCOPES.filter((s) => s.includes("/auth/calendar")).every((s) => granted.has(s));
+      if (!calendarGranted) {
+        if (pending.purpose === "calendar") throw new Error("Google did not grant calendar access. Allow both calendar permissions on the consent screen and try again.");
+        res.redirect(safeNext(pending.next));
+        return;
       }
       const existing = services.store.getGoogleAccount(userId);
       const refresh = tokens.refresh_token ?? (existing ? services.sealer.open(existing.refreshTokenSealed) : undefined);

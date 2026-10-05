@@ -2,13 +2,35 @@
   "manifest_version": 3,
   "name": "Planner for Canvas",
   "version": "0.1.0",
-  "description": "Reads your Canvas assignments with your own login and sends them to your planner server, so your AI assistant can plan your week. Read-only.",
+  "description": "Reads your Canvas assignments with your own login, read-only, and sends them to your planner server for your AI assistant.",
+  "icons": { "16": "icons/icon-16.png", "32": "icons/icon-32.png", "48": "icons/icon-48.png", "128": "icons/icon-128.png" },
   "permissions": ["storage", "alarms", "scripting"],
   "host_permissions": ["https://*.instructure.com/*"],
   "optional_host_permissions": ["https://*/*", "http://localhost/*", "http://127.0.0.1/*"],
-  "background": { "service_worker": "background.js", "type": "module" },
-  "content_scripts": [{ "matches": ["https://*.instructure.com/*"], "js": ["content.js"], "run_at": "document_idle" }],
-  "options_page": "options.html",
-  "action": { "default_title": "Planner for Canvas: sync now" },
-  "minimum_chrome_version": "120"
+  "background": { "service_worker": "background.js", "scripts": ["background.js"], "type": "module" },
+  "content_scripts": [
+    {
+      "matches": ["https://*.instructure.com/*"],
+      "exclude_matches": [
+        "https://instructure.com/*",
+        "https://www.instructure.com/*",
+        "https://community.instructure.com/*",
+        "https://status.instructure.com/*",
+        "https://*.beta.instructure.com/*",
+        "https://*.test.instructure.com/*"
+      ],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "options_ui": { "page": "options.html", "open_in_tab": true },
+  "action": { "default_title": "Planner for Canvas", "default_icon": { "16": "icons/icon-16.png", "32": "icons/icon-32.png" } },
+  "minimum_chrome_version": "121",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "planner-for-canvas@canvas-agent",
+      "strict_min_version": "128.0",
+      "data_collection_permissions": { "required": ["websiteContent"] }
+    }
+  }
 }

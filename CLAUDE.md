@@ -13,7 +13,7 @@ Canvas workload, calibrated time estimates and study-block planning for AI assis
 
 - `packages/core`: pure library. Canvas client (`canvas/client.ts`), normaliser (`canvas/normalize.ts`), ICS (`ics.ts`), estimates (`estimate/`), planner (`plan/planner.ts`), SQLite store (`store/db.ts`), sync paths (`sync.ts`), sealing (`crypto.ts`), time zones (`tz.ts`).
 - `apps/server`: Express app. `services.ts` is the only place behaviour lives; MCP tools (`mcp/server.ts`), the settings page and the extension API all call it. Auth: `auth/bearer.ts` (who is calling), `auth/oauth-provider.ts` (our authorization server), `auth/login.ts` (people).
-- `apps/extension`: MV3, TypeScript, esbuild. `background.ts` reads Canvas and posts snapshots; `content.ts` is the dashboard button.
+- `apps/extension`: MV3, TypeScript, esbuild. `worker.ts` reads Canvas and posts snapshots (one sync per origin, locks, backoff); `background.ts` only starts it; `content.ts` is the dashboard button. Its tests drive the real worker against the stub through `test/fake-chrome.ts`.
 - `apps/stub-canvas`: fixtures and a fake API with real quirks. Tests and reviewers use it; never point it at real data.
 - `tests/`: integration tests across packages (sync, server end to end including OAuth and an MCP client).
 

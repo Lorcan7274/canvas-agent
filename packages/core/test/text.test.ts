@@ -37,6 +37,36 @@ describe("extractQuantities", () => {
     expect(extractQuantities("You have 30 minutes")).toMatchObject({ minutes: 30 });
     expect(extractQuantities("at least two peer-reviewed sources")).toMatchObject({ sources: 2 });
   });
+  it("reads ranges after the unit, lists, word ranges and thousands separators", () => {
+    expect(extractQuantities("Section 2.3 exercises 1-15")).toEqual({ problems: 15 });
+    expect(extractQuantities("Problems 3.1-3.15")).toEqual({ problems: 15 });
+    expect(extractQuantities("exercises 1-15 odd")).toEqual({ problems: 8 });
+    expect(extractQuantities("Read pages 112-140")).toEqual({ pages: 29 });
+    expect(extractQuantities("pp. 45–67")).toEqual({ pages: 23 });
+    expect(extractQuantities("Answer questions 1-10")).toEqual({ questions: 10 });
+    expect(extractQuantities("Read chapters 3 and 9")).toEqual({ chapters: 2 });
+    expect(extractQuantities("chapters 2, 5 and 9")).toEqual({ chapters: 3 });
+    expect(extractQuantities("two to three pages")).toEqual({ pages: 3 });
+    expect(extractQuantities("1.500 words")).toEqual({ words: 1500 });
+    expect(extractQuantities("between 1,000 and 1,500 words")).toEqual({ words: 1500 });
+    expect(extractQuantities("Write a five (5) page paper")).toEqual({ pages: 5 });
+  });
+  it("leaves alone what is not a count", () => {
+    for (const s of ["Read Chapter 4.12", "due 11:59 pm", "2 attempts", "100 points", "Covers sections 5.1-5.4.", "see page 5", "Answer in 10 words"]) {
+      const q = extractQuantities(s);
+      expect(q.pages ?? q.words ?? q.problems ?? q.questions ?? q.minutes, s).toBeUndefined();
+    }
+    expect(extractQuantities("Read Chapter 4")).toEqual({ chapters: 1 });
+  });
+  it("reads a duration only when it is effort or a time limit, never a window", () => {
+    expect(extractQuantities("a 90-minute exam").minutes).toBe(90);
+    expect(extractQuantities("time limit of 60 minutes").minutes).toBe(60);
+    expect(extractQuantities("This should take about 2 hours").minutes).toBe(120);
+    expect(extractQuantities("The exam is 2 hours long").minutes).toBe(120);
+    for (const s of ["Post within 48 hours", "You have 24 hours to complete this take-home", "Spend 2 hours per week", "Available for 24 hours", "You may spend up to 3 hours", "due 2 hours before class", "Late work accepted up to 48 hours after"]) {
+      expect(extractQuantities(s).minutes, s).toBeUndefined();
+    }
+  });
   it("returns nothing for prose without quantities", () => {
     expect(extractQuantities("Reflect on the lecture.")).toEqual({});
   });

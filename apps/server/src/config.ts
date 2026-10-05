@@ -16,7 +16,6 @@ export interface Config {
   allowedHosts?: string[];
   /** Hostnames of Canvas instances the extension may report for; empty = any. */
   canvasHostAllowlist: string[];
-  logLevel: "debug" | "info" | "warn";
   /** Off in tests; the OAuth endpoints, logins, pairing and feeds are rate limited otherwise. */
   rateLimit: boolean;
   /** NODE_ENV=production or an https BASE_URL: dev login and weak keys are refused. */
@@ -55,7 +54,6 @@ export function loadConfig(overrides: Partial<Config> = {}): Config {
     useLlm: (env("USE_LLM") ?? (env("ANTHROPIC_API_KEY") ? "true" : "false")) === "true",
     syncIntervalMinutes: Number(env("SYNC_INTERVAL_MINUTES") ?? 30),
     canvasHostAllowlist: (env("CANVAS_HOSTS") ?? "").split(",").map((s) => s.trim()).filter(Boolean),
-    logLevel: (env("LOG_LEVEL") as Config["logLevel"]) ?? "info",
     rateLimit: (env("RATE_LIMIT") ?? "on") !== "off",
     production,
     allowDevLogin: env("ALLOW_DEV_LOGIN") === "1",

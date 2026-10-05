@@ -62,6 +62,10 @@ export interface WorkItem {
   title: string;
   url?: string;
   dueAt?: string;
+  /** For calendar events: when it ends, so the planner can treat it as busy time. */
+  endAt?: string;
+  /** For calendar events: an all-day event (a holiday, a reading day); dueAt..endAt spans whole days, not busy hours. */
+  allDay?: boolean;
   unlockAt?: string;
   lockAt?: string;
   pointsPossible?: number;
@@ -83,7 +87,8 @@ export interface WorkItem {
   updatedAt: string;
 }
 
-export type EstimateBasis = "heuristic" | "llm" | "calibrated" | "logged";
+/** `llm_failed` is only ever stored (a negative cache entry for a task card), never returned by an estimate. */
+export type EstimateBasis = "heuristic" | "llm" | "calibrated" | "logged" | "llm_failed";
 
 export interface Estimate {
   itemId: string;
@@ -96,6 +101,10 @@ export interface Estimate {
   /** Hash of the item fields the estimate was derived from. */
   versionHash: string;
   createdAt: string;
+  /** Log-space spread behind p80 (p80 = p50 · e^(0.8416·sigma)). Stored with a task card. */
+  sigma?: number;
+  /** For an `llm_failed` entry: when asking the model again is worth it. */
+  retryAfter?: string;
 }
 
 export interface Actual {
@@ -175,4 +184,12 @@ export interface CanvasSnapshot {
   assignments?: Record<string, unknown>;
   /** Keyed by quiz id. */
   quizzes?: Record<string, unknown>;
+  /**
+   * The planner range `plannerItems` covers (`YYYY-MM-DD`, as sent to Canvas).
+   * Send it only when the planner list was read to its last page: the server
+   * then marks items in that range that Canvas no longer lists as gone.
+   */
+  plannerWindow?: { start: string; end: string };
+  /** Assignment ids from the wanted list whose detail fetch failed, so the server backs off on them. */
+  detailFailures?: string[];
 }

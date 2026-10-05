@@ -7,7 +7,9 @@
  * - Follows `Link: <...>; rel="next"` pagination, on the instance's own origin only,
  *   so the token never travels to another host.
  * - Strips the `while(1);` anti-hijack prefix Canvas adds to cookie-authed JSON.
- * - Backs off on 429 / "Rate Limit Exceeded", which Canvas meters per token.
+ * - Backs off on 429 and on a 403 whose body says "Rate Limit Exceeded", which
+ *   Canvas meters per token. Any other 403 is a refusal: Canvas sends
+ *   `X-Rate-Limit-Remaining` on every response, so the header proves nothing.
  * - Error messages carry the status code at most, never the response body.
  */
 import { DEFAULT_MAX_BYTES, DEFAULT_TIMEOUT_MS, assertPublicHttpsUrl, readTextCapped, safeFetcher } from "../egress.js";
@@ -17,6 +19,8 @@ export class CanvasError extends Error {
     message: string,
     public readonly status: number,
     public readonly url: string,
+    /** Still rate limited after every retry: stop asking for now, nothing is wrong with the item. */
+    public readonly throttled = false,
   ) {
     super(message);
     this.name = "CanvasError";
@@ -45,6 +49,16 @@ export interface CanvasClientOptions {
 }
 
 export type Query = Record<string, string | number | boolean | Array<string | number> | undefined>;
+
+/** Filled in by `getAll`: whether the page cap cut the list short. */
+export interface ListInfo {
+  truncated?: boolean;
+}
+
+/** Canvas's throttle answer: 429, or 403 with "403 Forbidden (Rate Limit Exceeded)" as the body. */
+export function isThrottleResponse(status: number, body: string): boolean {
+  return status === 429 || (status === 403 && /rate limit exceeded/i.test(body));
+}
 
 export function normaliseBaseUrl(input: string): string {
   let s = input.trim();
@@ -139,14 +153,16 @@ export class CanvasClient {
       const init: RequestInit = { method: "GET", headers, redirect: "manual", signal: this.signal ? AbortSignal.any([this.signal, timeout]) : timeout };
       if (this.withCredentials) init.credentials = "include";
       const res = await this.fetchImpl(target.toString(), init);
-      const throttled =
-        res.status === 429 ||
-        (res.status === 403 && (res.headers.get("x-rate-limit-remaining") !== null || /rate limit/i.test(await readTextCapped(res.clone(), 64 * 1024).catch(() => ""))));
+      const throttled = res.status === 429 || (res.status === 403 && isThrottleResponse(403, await readTextCapped(res.clone(), 64 * 1024).catch(() => "")));
       if (throttled && attempt < this.maxRetries) {
         attempt++;
         await res.body?.cancel().catch(() => undefined);
         await this.sleep(500 * 2 ** attempt);
         continue;
+      }
+      if (throttled) {
+        await res.body?.cancel().catch(() => undefined);
+        throw new CanvasError(`Canvas is rate limiting this account (${res.status}); the rest will be read on the next sync`, res.status, target.pathname, true);
       }
       if (res.status >= 300 && res.status < 400) {
         await res.body?.cancel().catch(() => undefined);
@@ -175,7 +191,7 @@ export class CanvasClient {
     return this.json<T>(await this.request(url), url);
   }
 
-  async getAll<T>(path: string, query?: Query): Promise<T[]> {
+  async getAll<T>(path: string, query?: Query, info?: ListInfo): Promise<T[]> {
     const out: T[] = [];
     let next: string | undefined = this.url(path, { per_page: 100, ...query });
     let pages = 0;
@@ -188,6 +204,7 @@ export class CanvasClient {
       next = link ? new URL(link, this.baseUrl).toString() : undefined;
       pages++;
     }
+    if (info) info.truncated = next !== undefined;
     return out;
   }
 
@@ -199,8 +216,8 @@ export class CanvasClient {
     return this.getAll("/api/v1/courses", { enrollment_state: "active", "include[]": ["term"] });
   }
 
-  plannerItems(startDate: string, endDate: string): Promise<unknown[]> {
-    return this.getAll("/api/v1/planner/items", { start_date: startDate, end_date: endDate });
+  plannerItems(startDate: string, endDate: string, info?: ListInfo): Promise<unknown[]> {
+    return this.getAll("/api/v1/planner/items", { start_date: startDate, end_date: endDate }, info);
   }
 
   missingSubmissions(): Promise<unknown[]> {

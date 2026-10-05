@@ -54,6 +54,9 @@ CREATE TABLE IF NOT EXISTS items (
   details_fetched_at TEXT,
   first_seen_at TEXT NOT NULL,
   last_seen_at TEXT NOT NULL,
+  details_failed_at TEXT,
+  details_failures INTEGER NOT NULL DEFAULT 0,
+  gone_at TEXT,
   PRIMARY KEY (user_id, id)
 );
 CREATE INDEX IF NOT EXISTS items_due ON items (user_id, due_at);
@@ -190,6 +193,8 @@ export interface User {
   name: string | null;
   prefs: Preferences;
   createdAt: string;
+  /** "google" once the account has signed in through Google; a permanent mark the dev login honours. */
+  signInProvider: string | null;
 }
 
 export interface CanvasAccount {
@@ -213,7 +218,13 @@ export interface ItemRow {
   versionHash: string;
   detailsFetchedAt: string | null;
   firstSeenAt: string;
+  /** Last time the row was written (an unchanged re-sync writes nothing). */
   lastSeenAt: string;
+  /** Detail fetches that failed (or found the item locked) in a row, and when the last one did. */
+  detailsFailures: number;
+  detailsFailedAt: string | null;
+  /** Set when Canvas stopped listing the item; such rows are left out of `listItems` until it comes back. */
+  goneAt: string | null;
 }
 
 export interface GoogleAccount {
@@ -266,6 +277,8 @@ export interface ActualSample {
   minutes: number;
   estimatedHours: number | null;
   createdAt: string;
+  /** How the student answered: a bucket's minutes stand for the bucket (calibration reads them as its bounds). */
+  source?: Actual["source"];
 }
 
 type Row = Record<string, unknown>;
@@ -275,6 +288,13 @@ export const MAX_PAIRING_ATTEMPTS = 5;
 
 export function now(): string {
   return new Date().toISOString();
+}
+
+/** An instant in `toISOString` form, so stored and compared times share one format; unparsable text is kept as it is. */
+function isoOrNull(s: string | undefined | null): string | null {
+  if (!s) return null;
+  const t = Date.parse(s);
+  return Number.isNaN(t) ? s : new Date(t).toISOString();
 }
 
 /**
@@ -309,6 +329,7 @@ export class Store {
     this.db = new DatabaseSync(path);
     this.db.exec(SCHEMA);
     // CREATE TABLE IF NOT EXISTS leaves an older file's tables as they were; add what later versions need.
+    this.ensureColumn("users", "signin_provider", "TEXT");
     this.ensureColumn("connector_keys", "expires_at", "TEXT");
     this.ensureColumn("oauth_tokens", "used_at", "TEXT");
     this.ensureColumn("oauth_tokens", "family_expires_at", "TEXT");
@@ -317,6 +338,42 @@ export class Store {
     this.ensureColumn("canvas_accounts", "verified_at", "TEXT");
     this.ensureColumn("pairing_codes", "lookup", "TEXT");
     this.ensureColumn("pairing_codes", "attempts", "INTEGER NOT NULL DEFAULT 0");
+    this.migrate();
+  }
+
+  /**
+   * Versioned schema changes, numbered by position: migration i brings the
+   * file to `PRAGMA user_version` i + 1, each in its own transaction. Append
+   * new ones at the end; never edit or reorder one that has shipped. Each must
+   * also be safe on a file created from the current SCHEMA (ensureColumn is).
+   */
+  private static readonly MIGRATIONS: ReadonlyArray<(s: Store) => void> = [
+    // 1: sync bookkeeping (vanished rows, detail retries) and due_at in one comparable form.
+    (s) => {
+      s.ensureColumn("items", "details_failed_at", "TEXT");
+      s.ensureColumn("items", "details_failures", "INTEGER NOT NULL DEFAULT 0");
+      s.ensureColumn("items", "gone_at", "TEXT");
+      const update = s.db.prepare("UPDATE items SET due_at = ? WHERE user_id = ? AND id = ?");
+      for (const r of s.db.prepare("SELECT user_id, id, due_at FROM items WHERE due_at IS NOT NULL").all() as Row[]) {
+        const due = isoOrNull(r["due_at"] as string);
+        if (due !== r["due_at"]) update.run(due, r["user_id"] as string, r["id"] as string);
+      }
+    },
+  ];
+
+  /** The file's schema version (`PRAGMA user_version`). */
+  schemaVersion(): number {
+    return Number((this.db.prepare("PRAGMA user_version").get() as Row | undefined)?.["user_version"] ?? 0);
+  }
+
+  private migrate(): void {
+    const all = Store.MIGRATIONS;
+    for (let v = this.schemaVersion(); v < all.length; v++) {
+      this.transaction(() => {
+        all[v]!(this);
+        this.db.exec(`PRAGMA user_version = ${v + 1}`);
+      });
+    }
   }
 
   private txDepth = 0;
@@ -381,7 +438,7 @@ export class Store {
     this.db
       .prepare("INSERT INTO users (id, email, name, prefs_json, created_at) VALUES (?, ?, ?, ?, ?)")
       .run(id, email, name, JSON.stringify(merged), createdAt);
-    return { id, email, name, prefs: merged, createdAt };
+    return { id, email, name, prefs: merged, createdAt, signInProvider: null };
   }
 
   getUser(id: string): User | undefined {
@@ -396,6 +453,11 @@ export class Store {
 
   listUsers(): User[] {
     return (this.db.prepare("SELECT * FROM users").all() as Row[]).map(rowToUser);
+  }
+
+  /** Marks how the account signs in. Survives a Google disconnect, so an email alone never reopens it. */
+  setSignInProvider(userId: string, provider: "google"): void {
+    this.db.prepare("UPDATE users SET signin_provider = ? WHERE id = ?").run(provider, userId);
   }
 
   updatePrefs(userId: string, patch: Partial<Preferences>): Preferences {
@@ -444,8 +506,33 @@ export class Store {
     return (this.db.prepare("SELECT * FROM canvas_accounts ORDER BY created_at").all() as Row[]).map(rowToAccount);
   }
 
-  deleteCanvasAccount(userId: string, id: string): void {
-    this.db.prepare("DELETE FROM canvas_accounts WHERE user_id = ? AND id = ?").run(userId, id);
+  /**
+   * Removes the account and, unless another of the student's accounts reads
+   * the same Canvas, every item from that Canvas (and the course list once no
+   * account is left). Returns the ids of the items removed, so the caller can
+   * clean up blocks planned for them.
+   */
+  deleteCanvasAccount(userId: string, id: string): string[] {
+    return this.transaction(() => {
+      const account = this.getCanvasAccount(id);
+      if (!account || account.userId !== userId) return [];
+      this.db.prepare("DELETE FROM canvas_accounts WHERE user_id = ? AND id = ?").run(userId, id);
+      const hostOf = (u: string) => {
+        try {
+          return new URL(u).host;
+        } catch {
+          return u;
+        }
+      };
+      const host = hostOf(account.baseUrl);
+      const rest = this.listCanvasAccounts(userId);
+      if (rest.some((a) => hostOf(a.baseUrl) === host)) return [];
+      const ids = (this.db.prepare("SELECT id FROM items WHERE user_id = ? AND json_extract(json, '$.host') = ?").all(userId, host) as Row[]).map((r) => r["id"] as string);
+      const del = this.db.prepare("DELETE FROM items WHERE user_id = ? AND id = ?");
+      for (const itemId of ids) del.run(userId, itemId);
+      if (!rest.length) this.db.prepare("DELETE FROM courses WHERE user_id = ?").run(userId);
+      return ids;
+    });
   }
 
   /** `ok` false counts a failed sync (backoff); true resets the count and marks the account verified. Partial errors can still be ok. */
@@ -484,30 +571,80 @@ export class Store {
     return r ? rowToItem(r) : undefined;
   }
 
-  upsertItem(userId: string, item: WorkItem, versionHash: string, opts: { detailsFetched?: boolean } = {}): void {
+  /**
+   * Writes the item, unless nothing changed: same JSON, same version, still
+   * listed and no new detail fetch to record (a re-sync of unchanged Canvas
+   * writes nothing). A write clears `gone_at`; a detail fetch resets the
+   * retry count. Returns whether it wrote.
+   */
+  upsertItem(userId: string, item: WorkItem, versionHash: string, opts: { detailsFetched?: boolean } = {}): boolean {
     const ts = now();
-    const existing = this.getItem(userId, item.id);
-    const detailsAt = opts.detailsFetched ? ts : existing?.detailsFetchedAt ?? null;
+    const json = JSON.stringify(item);
+    const existing = this.db
+      .prepare("SELECT json, version_hash, details_fetched_at, first_seen_at, gone_at FROM items WHERE user_id = ? AND id = ?")
+      .get(userId, item.id) as Row | undefined;
+    if (existing && !opts.detailsFetched && existing["gone_at"] === null && existing["json"] === json && existing["version_hash"] === versionHash) return false;
+    const detailsAt = opts.detailsFetched ? ts : ((existing?.["details_fetched_at"] as string | null | undefined) ?? null);
     this.db
       .prepare(
         `INSERT INTO items (user_id, id, json, due_at, status, source, version_hash, details_fetched_at, first_seen_at, last_seen_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(user_id, id) DO UPDATE SET json = excluded.json, due_at = excluded.due_at, status = excluded.status,
            source = excluded.source, version_hash = excluded.version_hash, details_fetched_at = excluded.details_fetched_at,
-           last_seen_at = excluded.last_seen_at`,
+           last_seen_at = excluded.last_seen_at, gone_at = NULL,
+           details_failures = CASE WHEN ? = 1 THEN 0 ELSE details_failures END,
+           details_failed_at = CASE WHEN ? = 1 THEN NULL ELSE details_failed_at END`,
       )
-      .run(userId, item.id, JSON.stringify(item), item.dueAt ?? null, item.status, item.source, versionHash, detailsAt, existing?.firstSeenAt ?? ts, ts);
+      .run(
+        userId,
+        item.id,
+        json,
+        isoOrNull(item.dueAt),
+        item.status,
+        item.source,
+        versionHash,
+        detailsAt,
+        (existing?.["first_seen_at"] as string | undefined) ?? ts,
+        ts,
+        opts.detailsFetched ? 1 : 0,
+        opts.detailsFetched ? 1 : 0,
+      );
+    return true;
   }
 
-  listItems(userId: string, opts: { from?: string; to?: string; includeUndated?: boolean } = {}): ItemRow[] {
-    const rows = this.db.prepare("SELECT * FROM items WHERE user_id = ? ORDER BY due_at IS NULL, due_at").all(userId) as Row[];
-    return rows.map(rowToItem).filter((r) => {
-      const due = r.item.dueAt;
-      if (!due) return opts.includeUndated ?? true;
-      if (opts.from && due < opts.from) return false;
-      if (opts.to && due > opts.to) return false;
-      return true;
-    });
+  /**
+   * Items by due date, filtered in SQL on the indexed due_at. Rows marked gone
+   * are left out unless `includeGone`; undated rows are in unless
+   * `includeUndated` is false.
+   */
+  listItems(userId: string, opts: { from?: string; to?: string; includeUndated?: boolean; includeGone?: boolean } = {}): ItemRow[] {
+    const where: string[] = ["user_id = ?"];
+    const args: string[] = [userId];
+    if (!opts.includeGone) where.push("gone_at IS NULL");
+    const range: string[] = ["due_at IS NOT NULL"];
+    if (opts.from) {
+      range.push("due_at >= ?");
+      args.push(isoOrNull(opts.from)!);
+    }
+    if (opts.to) {
+      range.push("due_at <= ?");
+      args.push(isoOrNull(opts.to)!);
+    }
+    where.push(opts.includeUndated ?? true ? `(due_at IS NULL OR (${range.join(" AND ")}))` : `(${range.join(" AND ")})`);
+    const rows = this.db.prepare(`SELECT * FROM items WHERE ${where.join(" AND ")} ORDER BY due_at IS NULL, due_at`).all(...args) as Row[];
+    return rows.map(rowToItem);
+  }
+
+  /** Marks items Canvas no longer lists. Writing them again (`upsertItem`) brings them back. */
+  markItemsGone(userId: string, ids: readonly string[], at = now()): void {
+    const stmt = this.db.prepare("UPDATE items SET gone_at = ? WHERE user_id = ? AND id = ? AND gone_at IS NULL");
+    for (const id of ids) stmt.run(at, userId, id);
+  }
+
+  /** Counts a failed (or locked) detail fetch; `needsDetails` waits longer after each one in a row. */
+  markDetailsFailed(userId: string, ids: readonly string[], at = now()): void {
+    const stmt = this.db.prepare("UPDATE items SET details_failures = details_failures + 1, details_failed_at = ? WHERE user_id = ? AND id = ?");
+    for (const id of ids) stmt.run(at, userId, id);
   }
 
   deleteItem(userId: string, id: string): void {
@@ -545,6 +682,7 @@ export class Store {
       minutes: r["minutes"] as number,
       estimatedHours: (r["estimated_hours"] as number | null) ?? null,
       createdAt: r["created_at"] as string,
+      source: r["source"] as Actual["source"],
     }));
   }
 
@@ -559,6 +697,7 @@ export class Store {
       minutes: r["minutes"] as number,
       estimatedHours: (r["estimated_hours"] as number | null) ?? null,
       createdAt: r["created_at"] as string,
+      source: r["source"] as Actual["source"],
     };
   }
 
@@ -960,6 +1099,7 @@ function rowToUser(r: Row): User {
     name: (r["name"] as string | null) ?? null,
     prefs: { ...DEFAULT_PREFERENCES, ...(JSON.parse(r["prefs_json"] as string) as Partial<Preferences>) },
     createdAt: r["created_at"] as string,
+    signInProvider: (r["signin_provider"] as string | null) ?? null,
   };
 }
 
@@ -986,6 +1126,9 @@ function rowToItem(r: Row): ItemRow {
     detailsFetchedAt: (r["details_fetched_at"] as string | null) ?? null,
     firstSeenAt: r["first_seen_at"] as string,
     lastSeenAt: r["last_seen_at"] as string,
+    detailsFailures: Number(r["details_failures"] ?? 0),
+    detailsFailedAt: (r["details_failed_at"] as string | null | undefined) ?? null,
+    goneAt: (r["gone_at"] as string | null | undefined) ?? null,
   };
 }
 

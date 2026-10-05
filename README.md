@@ -17,7 +17,7 @@ Canvas ──(browser extension, your session)─► ┘    │
 |---|---|---|
 | `packages/core` | TypeScript library | Canvas client and normaliser, ICS reader/writer, time-estimate engine (heuristic prior, optional Claude task cards, per-student calibration), the block planner, SQLite storage |
 | `apps/server` | Express + MCP SDK | The MCP endpoint (`/mcp`), an OAuth 2.1 authorization server for assistants, the settings page, the extension API, the planned-blocks ICS feed, Google Calendar writes, background syncs |
-| `apps/extension` | Chrome/Edge MV3 (Firefox-compatible) | Reads Canvas with your logged-in session (GET only), posts a snapshot to the server, adds a "Plan my week" button to the Canvas dashboard |
+| `apps/extension` | Chrome/Edge MV3; the same build loads in Firefox 128+ | Reads Canvas with your logged-in session (GET only), posts a snapshot to the server, adds a "Plan my week" button to the Canvas dashboard |
 | `apps/stub-canvas` | Fake Canvas | A term of realistic data behind the real API quirks, for tests, local development and connector reviewers |
 
 ## Quick start (for yourself)
@@ -36,10 +36,10 @@ Then:
 2. **Connect Canvas**, by whichever route your school allows:
    - **Calendar feed** (works everywhere): Canvas → Calendar → *Calendar Feed* → paste the `.ics` link. Titles and due dates, refreshed every 30 minutes.
    - **Personal access token** (if *Account → Settings → New Access Token* exists for you): full details, refreshed every 30 minutes. Student tokens expire within 120 days.
-   - **Browser extension** (full details, no token): `pnpm --filter @canvas-agent/extension build`, load `apps/extension/build` unpacked in Chrome, open its options, paste the server URL and a pairing code from the settings page. It syncs whenever you have Canvas open.
+   - **Browser extension** (full details, no token): `pnpm --filter @canvas-agent/extension build`, load `apps/extension/build` unpacked in Chrome or Edge (Firefox: `about:debugging` → *Load Temporary Add-on* → `build/manifest.json`; not signed or listed yet), open its options, paste the server URL and a pairing code from the settings page. Then open your Canvas while signed in: a `*.instructure.com` Canvas is found by itself; a school's own address (`canvas.school.edu`) is added in the options. Beta and test copies (`*.beta.instructure.com`, `*.test.instructure.com`) are never synced, since they reuse production's ids. It syncs when you open Canvas (at most every 10 minutes), every 30 minutes while your session lasts, and when you click its toolbar button.
 3. **Connect your assistant.** The MCP URL is `<server>/mcp`.
    - **Claude Code** (works with localhost): `claude mcp add --transport http planner http://localhost:8787/mcp --header "Authorization: Bearer ck_…"` using a connector key from the settings page.
-   - **claude.ai / Claude Desktop / ChatGPT**: these connect from the vendor's cloud, so the server needs a public HTTPS URL (deploy it, or expose it with a tunnel such as `cloudflared tunnel --url http://localhost:8787` and set `BASE_URL` to the tunnel URL). An https `BASE_URL` counts as production, so dev login is refused there: configure Google sign-in (below) first, and do not set `ALLOW_DEV_LOGIN` on a public URL. Add a custom connector with the `/mcp` URL and sign in when asked; the server is its own OAuth provider.
+   - **claude.ai / Claude Desktop / ChatGPT**: these connect from the vendor's cloud, so the server needs a public HTTPS URL (deploy it, or expose it with a tunnel such as `cloudflared tunnel --url http://localhost:8787` and set `BASE_URL` to the tunnel URL). A quick tunnel gets a new random URL every time it starts, and `BASE_URL` is the OAuth issuer and the MCP resource, so each new URL breaks the connector and the Google redirect URI: use a named tunnel or a fixed domain for anything you keep. An https `BASE_URL` counts as production, so dev login is refused there: configure Google sign-in (below) first, and do not set `ALLOW_DEV_LOGIN` on a public URL. Add a custom connector with the `/mcp` URL and sign in when asked; the server is its own OAuth provider.
 4. **Calendar.** Without Google configured, commit a plan and subscribe to the ICS feed shown on the settings page in any calendar app. With Google configured (below), blocks are written to your primary calendar and the planner reads your busy time.
 
 Try the prompts the connector ships: *Plan my week*, *What's due*, *Weekly check-in*.
@@ -57,26 +57,38 @@ Environment variables (see `.env.example`; `node --env-file=.env …` loads them
 | `AUTH_MODE` | `google` when Google is configured, else `dev` | `dev` = email-only login form; the server refuses to start with it in production |
 | `ALLOW_DEV_LOGIN` | off | `1` allows dev login in production, for a private test deployment only: anyone who can reach it can sign in as any non-Google account |
 | `ALLOWED_HOSTS` | loopback names when `BASE_URL` is localhost, else any | Comma-separated `Host` headers the server answers |
-| `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | | Sign in with Google + Calendar. Redirect URI: `BASE_URL/oauth/google/callback`. Scopes: `calendar.events`, `calendar.freebusy` (sensitive; under 100 users Google's "testing" mode needs no verification) |
+| `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | | Sign in with Google + Calendar. Redirect URI: `BASE_URL/oauth/google/callback`. Scopes: `calendar.events`, `calendar.freebusy` (sensitive; see [Google sign-in](#google-sign-in)) |
 | `ANTHROPIC_API_KEY`, `USE_LLM` | heuristic only | With a key, each new assignment gets one Claude task card (steps, quantities, p50/p80), shared by everyone who has that assignment |
 | `SYNC_INTERVAL_MINUTES` | `30` | Token and feed re-sync cadence |
 | `CANVAS_HOSTS` | any | Comma-separated Canvas hostnames this server accepts |
 | `RATE_LIMIT` | `on` | `off` only in tests |
 
+### Google sign-in
+
+Create an OAuth client (type *Web application*) in Google Cloud with the redirect URI above, and enable the Google Calendar API. The calendar scopes are *sensitive*, which matters for the consent screen's publishing status:
+
+- **Testing**: only the test users you add by hand (up to 100) can sign in, and Google expires their refresh tokens after 7 days, so calendar writes stop and everyone has to sign in again every week.
+- **In production, unverified**: works for up to 100 users without Google's verification review; they see a "Google hasn't verified this app" screen once (*Advanced* → continue). This is the setting to use for yourself or a small group.
+
+Past 100 users, the app needs Google's verification for sensitive scopes.
+
 ## The MCP surface
 
 | Tool | Kind | Does |
 |---|---|---|
-| `get_workload` | read | Items due in a period with status, p50/p80 estimate, planned minutes, and pending check-ins |
+| `get_workload` | read | Items due in a period with status, p50/p80 estimate, planned minutes, and pending check-ins; Canvas calendar events listed apart, without estimates; paged with `limit` and `nextFrom` |
 | `get_assignment` | read | Full record: description, rubric size, quiz facts, estimate reasoning and steps, planned blocks, same-course history |
 | `propose_plan` | read | Blocks placed in work windows, around busy time, before due dates with a buffer, under the daily cap. Nothing saved |
-| `commit_plan` | write, additive | Saves agreed blocks; writes Google events when connected; always in the ICS feed |
-| `clear_plan` | write, destructive | Removes still-planned blocks (and their events) |
+| `commit_plan` | write, additive, idempotent | Saves agreed blocks (at most 40 per call; a block already saved is returned, not saved twice); writes Google events when connected; always in the ICS feed |
+| `clear_plan` | write, destructive | Removes planned and moved blocks from now on (or a given period), with their events; past and done blocks stay |
+| `get_plan` | read | The study blocks saved in a period, with their ids and status |
+| `move_block` | write, destructive | Moves one block, and its calendar event |
+| `remove_blocks` | write, destructive | Deletes particular blocks by id, with their events |
 | `log_time` | write, additive | Minutes or a bucket (`<1h`, `1-2h`, `2-4h`, `4-8h`, `8h+`); calibrates future estimates |
 | `get_preferences` / `set_preferences` | read / write | Time zone, work windows, daily cap, block sizes, buffer, which assistant the Canvas button opens |
 | `get_profile` | read | Stable account id (ChatGPT multi-account) |
 
-Every tool carries a title and `readOnlyHint`/`destructiveHint`, which both connector directories require.
+Twelve tools; every one carries a title and `readOnlyHint`/`destructiveHint`, which both connector directories require.
 
 ## How estimates work
 
@@ -92,7 +104,8 @@ p80 is used automatically for anything due within 72 hours.
 
 ## Privacy and safety
 
-- The server only ever **reads** Canvas. The extension sends GET requests with your session; it never submits, posts or messages.
+- [`docs/PRIVACY.md`](docs/PRIVACY.md) is the full privacy policy: what the extension reads and sends, what the server stores, who else receives what, how long it is kept.
+- The server only ever **reads** Canvas. The extension sends GET requests with your session; it never submits, posts or messages. It cuts every snapshot down to the fields the planner reads before it leaves the browser.
 - Canvas tokens, feed URLs and Google tokens are sealed with AES-256-GCM under `SECRET_KEY`. Connector keys, device tokens and OAuth tokens are stored hashed.
 - Nothing from one student's account is visible to another; pooled estimates are medians over at least five students.
 - Delete everything from the settings page (remove accounts, revoke keys, disconnect assistants and Google) or by deleting the SQLite file.
@@ -105,7 +118,8 @@ pnpm check                          # typecheck + vitest
 pnpm stub                           # fake Canvas on :3999 (token stub-token, feed URL printed)
 EGRESS_ALLOW_LOOPBACK=1 pnpm dev    # needed to point the server at the stub: outbound requests to loopback are refused otherwise
 pnpm dev                            # server with tsx watch
-pnpm --filter @canvas-agent/extension build
+pnpm --filter @canvas-agent/extension build   # into apps/extension/build, icons drawn by icons.mjs
+npx vitest run apps/extension               # the extension's worker against the stub and the server, through a fake `chrome`
 ```
 
-Tests run against the stub, including the full OAuth flow an assistant performs and an MCP client calling every tool. See `docs/DESIGN.md` for the reasoning behind the architecture and what is not built yet.
+Tests run against the stub, including the full OAuth flow an assistant performs, an MCP client calling every tool, and the extension's sync (pairing, detection, batching, locks, backoff, removal). `CHANGELOG.md` lists releases. See `docs/DESIGN.md` for the reasoning behind the architecture and what is not built yet.

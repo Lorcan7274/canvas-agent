@@ -114,8 +114,13 @@ export function createApp({ services, fetchImpl = fetch, log = console.error }: 
   app.use(loginRoutes(services, provider));
   app.use(settingsRoutes(services));
 
-  app.use((err: Error & { status?: number; expose?: boolean }, _req: Request, res: Response, _next: NextFunction) => {
+  app.use((err: Error & { status?: number; expose?: boolean; type?: string }, req: Request, res: Response, _next: NextFunction) => {
     if (res.headersSent) return;
+    // An MCP client sent something that is not JSON: answer in JSON-RPC, as the transport would.
+    if (req.path === "/mcp" && err.type === "entity.parse.failed") {
+      res.status(400).json({ jsonrpc: "2.0", error: { code: -32700, message: "Parse error: the request body is not valid JSON" }, id: null });
+      return;
+    }
     // Client mistakes the body parser reports (too large, malformed JSON) stay 4xx; everything else is ours.
     if (typeof err.status === "number" && err.status >= 400 && err.status < 500) {
       // Parser messages quote the body; say only what kind of mistake it was.

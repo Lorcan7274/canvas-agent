@@ -2,39 +2,49 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Planner for Canvas</title>
 <style>
-body{font:15px/1.5 system-ui,sans-serif;max-width:40rem;margin:2rem auto;padding:0 1rem;color:#1f1d1a}
-h1{font-size:1.3rem}h2{font-size:1.05rem;margin-top:1.5rem}label{display:block;font-size:.9rem;color:#666;margin-top:.5rem}
-input{width:100%;padding:.45rem .6rem;border:1px solid #ddd;border-radius:6px;font:inherit}button{margin-top:.5rem;padding:.45rem .9rem;border-radius:6px;border:1px solid #1d4ed8;background:#1d4ed8;color:#fff;font:inherit;cursor:pointer}
-button.quiet{background:#fff;color:#333;border-color:#bbb}p.out{color:#444;min-height:1.2em}ul{padding-left:1.2rem}code{font-family:ui-monospace,monospace}
+body{font:15px/1.5 system-ui,sans-serif;max-width:40rem;margin:2rem auto;padding:0 1rem;color:#1f1d1a;background:#fff}
+h1{font-size:1.3rem}h2{font-size:1.05rem;margin-top:1.5rem}label{display:block;font-size:.9rem;color:#555;margin-top:.5rem}
+input{width:100%;box-sizing:border-box;padding:.45rem .6rem;border:1px solid #ccc;border-radius:6px;font:inherit}
+button{margin-top:.5rem;padding:.45rem .9rem;border-radius:6px;border:1px solid #1d4ed8;background:#1d4ed8;color:#fff;font:inherit;cursor:pointer}
+button.quiet{background:#fff;color:#333;border-color:#bbb}button.small{margin:0 0 0 .5rem;padding:.1rem .5rem;font-size:.85rem}
+p.out{color:#444;min-height:1.2em}ul{padding-left:1.2rem}li{margin:.3rem 0}code{font-family:ui-monospace,monospace}.muted{color:#666;font-size:.9rem}
 </style>
 </head>
 <body>
 <h1>Planner for Canvas</h1>
-<p>This extension reads your Canvas assignments with your own login (read-only) and sends them to your planner server. Nothing is written back to Canvas.</p>
+<p>This extension reads your Canvas assignments with your own login and sends them to your planner server. It only ever reads: nothing is written back to Canvas.</p>
 
 <h2>1. Pair with your planner server</h2>
 <p>On the server's settings page, generate a pairing code, then enter it here within 15 minutes. Status: <b id="paired"></b></p>
 <form id="pair-form">
-  <label>Server URL</label><input id="server" placeholder="https://planner.example.com" required>
-  <label>Pairing code</label><input id="code" placeholder="ABCD-EFGH-JKLM" autocomplete="off" required>
+  <label for="server">Server URL</label><input id="server" placeholder="https://planner.example.com" required>
+  <label for="code">Pairing code</label><input id="code" placeholder="ABCD-EFGH-JKLM" autocomplete="off" required>
   <button type="submit">Pair</button>
 </form>
-<p class="out" id="pair-result"></p>
+<p class="out" id="pair-result" role="status"></p>
 
 <h2>2. Your school's Canvas address</h2>
-<p>Instances on <code>*.instructure.com</code> work out of the box. If your school uses its own address (for example <code>canvas.school.edu</code>), add it here and allow the permission prompt.</p>
+<p>Canvas on <code>school.instructure.com</code> is found by itself: open it once while signed in. Beta and test copies (<code>school.beta.instructure.com</code>, <code>school.test.instructure.com</code>) are never synced, because they carry the same assignment ids as the real one. If your school uses its own address (for example <code>canvas.school.edu</code>), sign in there in another tab, then add it here and allow the permission prompt.</p>
 <form id="origin-form">
-  <label>Canvas address</label><input id="origin" placeholder="canvas.school.edu">
+  <label for="origin">Canvas address</label><input id="origin" placeholder="canvas.school.edu">
   <button type="submit">Add</button>
 </form>
-<p class="out" id="origin-result"></p>
+<p class="out" id="origin-result" role="status"></p>
 
 <h2>Status</h2>
 <ul id="origins"></ul>
-<button id="sync" class="quiet">Sync now</button>
-<button id="unpair" class="quiet">Forget everything</button>
+<p class="muted" id="ignored-head" hidden>Not synced:</p>
+<ul id="ignored"></ul>
+<button id="sync" class="quiet" type="button">Sync now</button>
+<button id="unpair" class="quiet" type="button">Forget everything</button>
+<p class="out" id="status-result" role="status"></p>
+<p class="muted">"Forget everything" removes the pairing, your Canvas addresses, sync results and the extra permissions from this browser. The device stays listed on the planner's settings page until you remove it there.</p>
+
+<h2>The "Plan my week" button</h2>
+<p class="muted">The dashboard button opens the assistant chosen on the planner's settings page with a planning prompt. ChatGPT sends a prompt passed in its address (<code>?q=</code>) as soon as the page opens, before you can turn the planner connector on for that chat: enable the connector in ChatGPT first, or the first answer will not see your Canvas.</p>
 
 <script type="module" src="options.js"></script>
 </body>

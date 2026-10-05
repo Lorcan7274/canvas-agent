@@ -1,4 +1,4 @@
-/** Background work: periodic Canvas syncs, calendar reconciliation, expiry purges. */
+/** Background work: periodic Canvas syncs, calendar reconciliation, model task cards, expiry purges. */
 import type { CanvasAccount } from "@canvas-agent/core";
 import type { Services } from "./services.js";
 import { googleErrorMessage } from "./google/calendar.js";
@@ -55,9 +55,19 @@ export function startJobs(services: Services, intervalMinutes: number, log: (msg
       for (const user of services.store.listUsers()) {
         try {
           const s = await services.reconcileGoogle(user.id);
-          if (s.moved || s.deleted) log(`calendar reconcile ${user.id}: ${s.moved} moved, ${s.deleted} deleted`);
+          if (s.moved || s.deleted || s.errors) log(`calendar reconcile ${user.id}: ${s.moved} moved, ${s.deleted} deleted${s.errors ? `, ${s.errors} could not be read` : ""}`);
         } catch (e) {
           log(`calendar reconcile ${user.id}: ${googleErrorMessage(e)}`);
+        }
+      }
+      // Model task cards are built here, two at a time, so no tool call ever waits on the model.
+      if (services.config.useLlm) {
+        for (const user of services.store.listUsers()) {
+          try {
+            await services.warmEstimates(user.id, { concurrency: 2 });
+          } catch (e) {
+            log(`estimates ${user.id}: ${(e as Error).name}`);
+          }
         }
       }
     } finally {

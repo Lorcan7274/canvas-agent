@@ -1,6 +1,6 @@
 /** JSON routes used by the browser extension. */
 import { Router, type Request, type Response, type NextFunction } from "express";
-import { hashToken, ingestSnapshot, projectCanvasSnapshot, type CanvasSnapshot } from "@canvas-agent/core";
+import { hashToken, ingestSnapshot, normaliseBaseUrl, pickDetailCandidates, projectCanvasSnapshot, type CanvasSnapshot } from "@canvas-agent/core";
 import type { Services } from "../services.js";
 
 declare module "express-serve-static-core" {
@@ -109,14 +109,27 @@ export function apiRoutes(services: Services): Router {
     }
   });
 
-  /** Which detail fetches the extension should do next: assignment-backed items without details. */
+  /**
+   * Which detail fetches the extension should do next, by the same rule as the
+   * token sync (`needsDetails`: new, changed, unlocked, not backing off after a
+   * failure), upcoming work first. `?baseUrl=` limits it to one Canvas.
+   */
   r.get("/api/ingest/wanted", requireDevice(services), (req, res) => {
     const userId = req.deviceUserId!;
-    const wanted = services.store
-      .listItems(userId, { from: new Date(Date.now() - 7 * 86_400_000).toISOString() })
-      .filter((r) => r.item.assignmentId && r.item.courseId && !r.detailsFetchedAt && !["done", "dismissed", "graded"].includes(r.item.status))
-      .slice(0, 40)
-      .map((r) => ({ courseId: r.item.courseId, assignmentId: r.item.assignmentId, quizId: r.item.quizId ?? null }));
+    const baseUrl = req.query["baseUrl"];
+    let host: string | undefined;
+    if (baseUrl !== undefined) {
+      try {
+        if (typeof baseUrl !== "string") throw new Error("baseUrl");
+        host = new URL(normaliseBaseUrl(baseUrl)).host;
+      } catch {
+        res.status(400).json({ error: "baseUrl must be the Canvas address, e.g. https://canvas.school.edu" });
+        return;
+      }
+    }
+    const nowIso = new Date().toISOString();
+    const rows = services.store.listItems(userId, { from: new Date(Date.now() - 7 * 86_400_000).toISOString() }).filter((r) => host === undefined || r.item.host === host);
+    const wanted = pickDetailCandidates(rows, nowIso, 40).map((r) => ({ courseId: r.item.courseId, assignmentId: r.item.assignmentId, quizId: r.item.quizId ?? null }));
     res.json({ wanted });
   });
 

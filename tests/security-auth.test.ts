@@ -214,13 +214,16 @@ function fakeGoogle(): GoogleCalendar {
     "code-attacker": { email: "attacker@example.edu", email_verified: true, name: "Attacker" },
     "code-victim": { email: "victim@example.edu", email_verified: true, name: "Victim" },
     "code-unverified": { email: "unverified@example.edu", email_verified: false, name: "Nobody" },
+    "code-noscope": { email: "noscope@example.edu", email_verified: true, name: "Unticked" },
   };
+  const FULL_SCOPE = "openid email https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/calendar.freebusy";
   const fakeFetch = (async (input: string | URL | Request, init?: RequestInit) => {
     const url = String(input instanceof Request ? input.url : input);
     if (url === "https://oauth2.googleapis.com/token") {
       const code = new URLSearchParams(String(init?.body)).get("code") ?? "";
       if (!people[code]) return new Response("{}", { status: 400 });
-      return Response.json({ access_token: `gat-${code}`, expires_in: 3600, refresh_token: `grt-${code}`, scope: "openid email" });
+      // "code-noscope" is a student who unticked the calendar permissions on Google's consent screen.
+      return Response.json({ access_token: `gat-${code}`, expires_in: 3600, refresh_token: `grt-${code}`, scope: code === "code-noscope" ? "openid email" : FULL_SCOPE });
     }
     if (url === "https://openidconnect.googleapis.com/v1/userinfo") {
       const auth = new Headers(init?.headers).get("authorization") ?? "";
@@ -290,6 +293,31 @@ describe("Google sign-in is bound to the browser that started it", () => {
     expect(res.status).toBe(502);
     expect(sidFrom(res)).toBeUndefined();
     expect(app.store.getUserByEmail("unverified@example.edu")).toBeUndefined();
+  });
+
+  it("signs a student in but stores no calendar when the calendar scopes were unticked", async () => {
+    const sid = await signIn("code-noscope");
+    const user = app.store.getUserByEmail("noscope@example.edu")!;
+    expect(app.store.getGoogleAccount(user.id)).toBeUndefined();
+    // Connecting the calendar on purpose with the same half-grant is an error, not a silent "connected".
+    const { state, nonce } = await start("purpose=calendar", sid);
+    const res = await callback(state, "code-noscope", `${sid}; gstate=${nonce}`);
+    expect(res.status).toBe(502);
+    expect(await res.text()).toContain("calendar access");
+    expect(app.store.getGoogleAccount(user.id)).toBeUndefined();
+  });
+
+  it("marks a Google account permanently, so the dev login refuses it even after the calendar link is gone", async () => {
+    await signIn("code-victim");
+    expect(app.store.getUserByEmail("victim@example.edu")!.signInProvider).toBe("google");
+    // The guard itself lives behind the dev login, which only a dev-mode server exposes.
+    const dev = await startApp();
+    const user = dev.store.createUser("marked@example.edu", "Marked");
+    dev.store.setSignInProvider(user.id, "google");
+    expect(dev.store.getGoogleAccount(user.id)).toBeUndefined();
+    const { res, sid } = await devLogin(dev.base, "marked@example.edu", { origin: dev.base, "sec-fetch-site": "same-origin" });
+    expect(res.status).toBe(403);
+    expect(sid).toBeUndefined();
   });
 
   it("does not reflect Google's error into a URL", async () => {

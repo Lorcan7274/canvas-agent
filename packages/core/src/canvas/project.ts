@@ -71,7 +71,7 @@ export function pickCourse(raw: unknown): Raw | undefined {
   return out;
 }
 
-const PLANNABLE_KEYS = ["id", "assignment_id", "course_id", "due_at", "todo_date", "start_at", "title", "name", "updated_at", "unlock_at", "lock_at", "points_possible"] as const;
+const PLANNABLE_KEYS = ["id", "assignment_id", "course_id", "due_at", "todo_date", "start_at", "end_at", "all_day", "title", "name", "updated_at", "unlock_at", "lock_at", "points_possible"] as const;
 
 export function pickPlannerItem(raw: unknown, origin: string): Raw | undefined {
   const r = obj(raw);
@@ -90,6 +90,7 @@ export function pickPlannerItem(raw: unknown, origin: string): Raw | undefined {
   if (subs) out["submissions"] = pick(subs, ["late", "excused", "graded", "submitted", "missing"]);
   const override = obj(r["planner_override"]);
   if (override) out["planner_override"] = pick(override, ["dismissed", "marked_complete"]);
+  else if (r["planner_override"] === null) out["planner_override"] = null;
   return out;
 }
 
@@ -108,6 +109,7 @@ const ASSIGNMENT_KEYS = [
   "peer_reviews",
   "group_category_id",
   "updated_at",
+  "locked_for_user",
 ] as const;
 
 export function pickAssignment(raw: unknown, origin: string): Raw | undefined {
@@ -131,6 +133,10 @@ export function pickAssignment(raw: unknown, origin: string): Raw | undefined {
   if (obj(a["external_tool_tag_attributes"])) out["external_tool_tag_attributes"] = {};
   const sub = obj(a["submission"]);
   if (sub) out["submission"] = pick(sub, ["submitted_at", "score", "late", "workflow_state", "excused", "missing"]);
+  // Missing submissions carry the student's planner marks; null (no mark) is kept so it can clear an old one.
+  const override = obj(a["planner_override"]);
+  if (override) out["planner_override"] = pick(override, ["dismissed", "marked_complete"]);
+  else if (a["planner_override"] === null) out["planner_override"] = null;
   const course = pickCourse(a["course"]);
   if (course) out["course"] = course;
   return out;
@@ -184,5 +190,11 @@ export function projectCanvasSnapshot(snap: CanvasSnapshot): CanvasSnapshot {
   if (snap.missingSubmissions !== undefined) out.missingSubmissions = list(snap.missingSubmissions, SNAPSHOT_LIMITS.missingSubmissions, (x) => pickAssignment(x, origin));
   if (snap.assignments !== undefined) out.assignments = detailMap(snap.assignments, (x) => pickAssignment(x, origin));
   if (snap.quizzes !== undefined) out.quizzes = detailMap(snap.quizzes, pickQuiz);
+  const w = obj(snap.plannerWindow);
+  const day = (v: unknown): v is string => typeof v === "string" && /^\d{4}-\d{2}-\d{2}(T[\d:.]{2,15}Z)?$/.test(v);
+  if (w && day(w["start"]) && day(w["end"])) out.plannerWindow = { start: w["start"], end: w["end"] };
+  if (Array.isArray(snap.detailFailures)) {
+    out.detailFailures = snap.detailFailures.filter((x): x is string => typeof x === "string" && /^\d{1,20}$/.test(x)).slice(0, SNAPSHOT_LIMITS.details);
+  }
   return out;
 }

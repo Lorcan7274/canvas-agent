@@ -37,17 +37,29 @@ type Shape =
   | "reflection"
   | "generic";
 
+/**
+ * First match wins, title before description. Modifiers come before the nouns
+ * they modify: "Final Project" is a project, "Final Paper" a paper, "Problem
+ * Set 4: Regression Analysis" a problem set, "Exam review problems" a problem
+ * set, "Chapter 1 Pre-test" a quiz. "Final"/"midterm" make an exam only on
+ * their own or before exam/test; "test" counts only as its own word, never in
+ * "pre-test", "unit test" or "test cases".
+ */
+const EXAM_RE =
+  /\b(?:mid-?terms?\b(?!\s*(?:review|prep|study|guide|paper|project|essay|report))|finals?\b(?=\s*(?:exams?|examinations?|tests?|$|[:\-–(,\d]))|exam(?:ination)?s?\b(?!\s*(?:review|prep|preparation|study|guide|practice|wrapper|corrections?))|(?<!(?:pre|post|unit|practice|pilot)[\s-]?)test\b(?![\s-]*(?:cases?|data|suites?|plans?|bench|drivers?|files?|runs?|harness|prep|review)))/i;
+
 const SHAPE_RULES: Array<[Shape, RegExp]> = [
-  ["exam", /\b(final|midterm|exam|test)\b(?!\s*(?:case|data|prep sheet))/i],
-  ["project", /\b(project|capstone|portfolio|prototype)\b/i],
-  ["presentation", /\b(presentation|slides|pitch|talk)\b/i],
-  ["lab", /\b(lab(?:oratory)? report|lab\s*\d|practical)\b/i],
-  ["paper", /\b(essay|paper|report|literature review|analysis|thesis|memo|case study|research)\b/i],
-  ["reflection", /\b(reflection|journal|response|reaction)\b/i],
-  ["reading", /\b(read(?:ing)?|chapter|ch\.?\s*\d|textbook|article)\b/i],
-  ["problem_set", /\b(problem set|homework|hw|pset|exercises|worksheet|assignment\s*\d|practice)\b/i],
-  ["discussion", /\b(discussion|forum|post|reply)\b/i],
-  ["quiz", /\b(quiz|check-?in|knowledge check)\b/i],
+  ["project", /\b(?:project|capstone|portfolio|prototype)\b/i],
+  ["presentation", /\b(?:presentation|slides|pitch|talk)\b/i],
+  ["lab", /\b(?:lab(?:oratory)? report|lab\s*#?\d|practical)\b/i],
+  ["problem_set", /\b(?:problem sets?|problems|psets?|exercises|worksheets?|practice (?:problems|exams?|tests?|sets?|questions)|review (?:sheet|packet|problems|questions)|study guide)\b/i],
+  ["paper", /\b(?:essay|paper|report|literature review|analysis|thesis|memo|case study|research)\b/i],
+  ["reflection", /\b(?:reflection|journal|response|reaction)\b/i],
+  ["exam", EXAM_RE],
+  ["quiz", /\b(?:quiz(?:zes)?|pre-?test|post-?test|check-?in|knowledge check|self-?assessment)\b/i],
+  ["reading", /\b(?:read(?:ing)?|chapter|ch\.?\s*\d|textbook|article)\b/i],
+  ["problem_set", /\b(?:homework|hw|assignment\s*#?\d)\b/i],
+  ["discussion", /\b(?:discussion|forum|post|reply)\b/i],
 ];
 
 const BASE_HOURS: Record<Shape, number> = {
@@ -63,6 +75,15 @@ const BASE_HOURS: Record<Shape, number> = {
   quiz: 1,
   generic: 2,
 };
+
+/** Hours per required reply to classmates in a discussion. */
+const HOURS_PER_REPLY = 0.3;
+/** Most a rubric can stretch an estimate that had no quantities to size it. */
+const RUBRIC_CAP = 1.3;
+/** Review before a timed quiz: short ones, and ones of an hour or more. */
+const QUIZ_REVIEW_HOURS = 0.5;
+const LONG_QUIZ_MINUTES = 60;
+const LONG_QUIZ_REVIEW_HOURS = 2;
 
 function detectShape(item: WorkItem): Shape {
   const title = item.title;
@@ -81,11 +102,37 @@ function pointsFactor(points: number | undefined, median: number | undefined): n
   return Math.min(2.5, Math.max(0.5, f));
 }
 
-function fromQuantities(shape: Shape, q: Quantities, item: WorkItem): { hours?: number; why: string[] } {
+const REPLY_WORDS: Record<string, number> = { a: 1, an: 1, one: 1, another: 1, two: 2, three: 3, four: 4, five: 5, six: 6 };
+const REPLY_RES = [
+  /\b(?:reply|respond|comment)(?:\s+(?:to|on))?\s+(?:at least\s+|a minimum of\s+)?(\d{1,2}|a|an|one|another|two|three|four|five|six)\s+(?:(?:of\s+)?(?:your\s+)?(?:other\s+)?)(?:classmates?|peers?|others|students?|posts?)\b/i,
+  /\b(\d{1,2}|one|two|three|four|five|six)\s+(?:peer\s+|substantive\s+|substantial\s+|thoughtful\s+)?(?:replies|responses to (?:classmates|peers)|comments on)\b/i,
+];
+
+/** How many replies to classmates a discussion asks for, when it says. */
+export function requiredReplies(text: string): number | undefined {
+  for (const re of REPLY_RES) {
+    const m = re.exec(text);
+    if (!m?.[1]) continue;
+    const n = REPLY_WORDS[m[1].toLowerCase()] ?? Number(m[1]);
+    if (Number.isInteger(n) && n > 0 && n <= 10) return n;
+  }
+  return undefined;
+}
+
+interface Sizing {
+  hours?: number;
+  /** "high" when sized by words, pages, chapters, problems, questions or a Canvas time limit; "medium" for a duration the brief states. */
+  confidence?: "high" | "medium";
+  why: string[];
+}
+
+function sizeFromRecord(shape: Shape, q: Quantities, item: WorkItem, pf: number, ctx: HeuristicContext): Sizing {
   const why: string[] = [];
   let hours: number | undefined;
-  const writing = shape === "paper" || shape === "reflection" || shape === "project" || shape === "lab";
-  if (q.words) {
+  let confidence: Sizing["confidence"];
+  // A project's pages or words are its write-up, not the project: see `projectWriteUp`.
+  const writing = shape === "paper" || shape === "reflection" || shape === "lab";
+  if (q.words && shape !== "project") {
     hours = (q.words / 250) * 0.6 + 0.5;
     why.push(`${q.words} words ≈ ${hours.toFixed(1)}h at 250 words per 36 min plus setup`);
   } else if (q.pages && writing) {
@@ -98,32 +145,63 @@ function fromQuantities(shape: Shape, q: Quantities, item: WorkItem): { hours?: 
     hours = q.chapters * 1.5;
     why.push(`${q.chapters} chapter(s) ≈ ${hours.toFixed(1)}h at 90 min each`);
   }
-  if (q.problems) {
+  if (hours !== undefined) confidence = "high";
+  if (q.problems && shape !== "quiz") {
     const h = q.problems * 0.3 + 0.25;
     hours = hours ? hours + h : h;
+    confidence = "high";
     why.push(`${q.problems} problem(s) ≈ ${h.toFixed(1)}h at 18 min each`);
   }
-  if (q.sources && writing) {
-    const h = q.sources * 0.4;
-    hours = (hours ?? BASE_HOURS[shape]) + h;
-    why.push(`${q.sources} source(s) add ${h.toFixed(1)}h of reading`);
-  }
   if (shape === "quiz") {
-    const tl = item.quiz?.timeLimitMinutes;
+    const canvasLimit = item.quiz?.timeLimitMinutes;
+    const tl = canvasLimit ?? q.minutes;
     const qc = item.quiz?.questionCount ?? q.questions;
+    const examLike = EXAM_RE.test(item.title);
+    let review = QUIZ_REVIEW_HOURS;
+    let reviewWhy = "30 min review";
+    if (examLike) {
+      review = BASE_HOURS.exam * pf;
+      reviewWhy = `exam prep ${review.toFixed(1)}h (an exam taken as a quiz: base ${BASE_HOURS.exam}h × ${pf.toFixed(2)} for ${item.pointsPossible ?? "unknown"} points vs course median ${ctx.coursePointsMedian ?? 20})`;
+    } else if (tl !== undefined && tl >= LONG_QUIZ_MINUTES) {
+      review = LONG_QUIZ_REVIEW_HOURS;
+      reviewWhy = `${LONG_QUIZ_REVIEW_HOURS}h review (a timed quiz of an hour or more is studied for like a test)`;
+    }
     if (tl) {
-      hours = tl / 60 + 0.5;
-      why.push(`time limit ${tl} min plus 30 min review`);
+      hours = tl / 60 + review;
+      confidence = canvasLimit && !examLike ? "high" : "medium";
+      why.push(`time limit ${tl} min${canvasLimit ? "" : " (stated in the brief)"} plus ${reviewWhy}`);
     } else if (qc) {
-      hours = (qc * 2.5) / 60 + 0.5;
-      why.push(`${qc} question(s) at 2.5 min plus 30 min review`);
+      hours = (qc * 2.5) / 60 + review;
+      confidence = examLike ? "medium" : "high";
+      why.push(`${qc} question(s) at 2.5 min plus ${reviewWhy}`);
+    } else if (examLike) {
+      hours = review;
+      confidence = "medium";
+      why.push(reviewWhy);
     }
   }
-  if (q.minutes && !hours && shape !== "quiz") {
+  if (q.minutes && hours === undefined && shape !== "quiz" && shape !== "exam") {
     hours = q.minutes / 60;
-    why.push(`description states ${q.minutes} minutes`);
+    confidence = "medium";
+    why.push(`the brief states ${q.minutes} minutes`);
   }
-  return hours !== undefined ? { hours, why } : { why };
+  const out: Sizing = { why };
+  if (hours !== undefined) out.hours = hours;
+  if (confidence) out.confidence = confidence;
+  return out;
+}
+
+/** Hours for a project's written part, which comes on top of the build. */
+function projectWriteUp(q: Quantities): { hours: number; why: string } | undefined {
+  if (q.words) {
+    const h = (q.words / 250) * 0.6 + 0.5;
+    return { hours: h, why: `a ${q.words}-word write-up adds ${h.toFixed(1)}h` };
+  }
+  if (q.pages) {
+    const h = q.pages * 1.0 + 0.5;
+    return { hours: h, why: `a ${q.pages}-page write-up adds ${h.toFixed(1)}h at an hour per page` };
+  }
+  return undefined;
 }
 
 export function heuristicEstimate(item: WorkItem, ctx: HeuristicContext = {}): HeuristicResult {
@@ -132,31 +210,51 @@ export function heuristicEstimate(item: WorkItem, ctx: HeuristicContext = {}): H
   const q = extractQuantities(text);
   const why: string[] = [`looks like ${shape.replace("_", " ")}`];
   const features: Record<string, number | string | boolean> = { shape };
+  const pf = pointsFactor(item.pointsPossible, ctx.coursePointsMedian);
+  features["pointsFactor"] = Number(pf.toFixed(2));
 
   let hours: number;
-  let confidence: HeuristicResult["confidence"] = "low";
-  const fq = fromQuantities(shape, q, item);
-  if (fq.hours !== undefined) {
-    hours = fq.hours;
-    confidence = "high";
-    why.push(...fq.why);
+  let confidence: HeuristicResult["confidence"];
+  const sized = sizeFromRecord(shape, q, item, pf, ctx);
+  if (sized.hours !== undefined) {
+    // Sized by the record itself: points, rubric size and brief length no longer scale it.
+    hours = sized.hours;
+    confidence = sized.confidence ?? "medium";
+    why.push(...sized.why);
   } else {
     hours = BASE_HOURS[shape];
     confidence = shape === "generic" ? "low" : "medium";
-    why.push(`no quantities in the description, base ${hours}h for this kind`);
+    why.push(`nothing in the brief sizes it, base ${hours}h for this kind`);
+    if (pf !== 1) {
+      hours *= pf;
+      why.push(`${item.pointsPossible} points vs course median ${ctx.coursePointsMedian ?? 20}: ×${pf.toFixed(2)}`);
+    }
+    const writeUp = shape === "project" ? projectWriteUp(q) : undefined;
+    if (writeUp) {
+      hours += writeUp.hours;
+      why.push(writeUp.why);
+    }
+    if (shape === "exam" && q.minutes) {
+      hours += q.minutes / 60;
+      why.push(`plus the ${q.minutes}-minute sitting`);
+    }
+    if (item.rubricCriteria && item.rubricCriteria > 3) {
+      const raw = 1 + 0.1 * (item.rubricCriteria - 3);
+      const f = Math.min(RUBRIC_CAP, raw);
+      hours *= f;
+      why.push(`${item.rubricCriteria} rubric criteria: ×${f.toFixed(2)}${raw > RUBRIC_CAP ? " (capped)" : ""}`);
+    }
+    if (item.descriptionChars && item.descriptionChars > 2500) {
+      hours *= 1.2;
+      why.push("long brief: ×1.2");
+    }
   }
 
-  const pf = pointsFactor(item.pointsPossible, ctx.coursePointsMedian);
-  if (pf !== 1 && fq.hours === undefined) {
-    hours *= pf;
-    why.push(`${item.pointsPossible} points vs course median ${ctx.coursePointsMedian ?? 20}: ×${pf.toFixed(2)}`);
-  }
-  features["pointsFactor"] = Number(pf.toFixed(2));
-
-  if (item.rubricCriteria && item.rubricCriteria > 3) {
-    const f = 1 + 0.1 * (item.rubricCriteria - 3);
-    hours *= f;
-    why.push(`${item.rubricCriteria} rubric criteria: ×${f.toFixed(2)}`);
+  if (q.sources && (shape === "paper" || shape === "reflection" || shape === "project" || shape === "lab")) {
+    // Sources add reading time but do not say how big the piece is: confidence stays where it was.
+    const h = q.sources * 0.4;
+    hours += h;
+    why.push(`${q.sources} source(s) add ${h.toFixed(1)}h of reading`);
   }
   if (item.peerReviews) {
     hours += 0.5;
@@ -166,13 +264,13 @@ export function heuristicEstimate(item: WorkItem, ctx: HeuristicContext = {}): H
     hours *= 1.1;
     why.push("group work: ×1.10 for coordination");
   }
-  if (item.kind === "discussion") {
-    const replies = text.match(/\b(\w+|\d+)\s+(?:replies|responses|peers?|classmates)/i);
-    if (replies) why.push("replies to classmates included");
-  }
-  if (item.descriptionChars && item.descriptionChars > 2500 && fq.hours === undefined) {
-    hours *= 1.2;
-    why.push("long brief: ×1.2");
+  if (item.kind === "discussion" || shape === "discussion") {
+    const replies = requiredReplies(text);
+    if (replies) {
+      hours += replies * HOURS_PER_REPLY;
+      why.push(`${replies} required repl${replies === 1 ? "y" : "ies"} add ${(replies * HOURS_PER_REPLY).toFixed(1)}h at 18 min each`);
+      features["replies"] = replies;
+    }
   }
 
   hours = Math.max(0.25, hours);

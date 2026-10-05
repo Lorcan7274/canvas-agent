@@ -68,7 +68,7 @@ export function settingsRoutes(services: Services): Router {
     const grants = services.store.listOAuthGrants(userId);
     const devices = services.store.listDevices(userId);
     const workload = await services.workload(userId, {});
-    const checkIns = services.pendingCheckIns(userId);
+    const checkIns = workload.checkIns; // calibrated, same numbers the assistant shows
     const tz = user.prefs.timezone;
 
     const accountRows = accounts.length
@@ -207,9 +207,11 @@ ${checkIns.length ? `<h2>How long did these take?</h2><div class="card"><table>$
     back(req, res, { flash: report.errors.length ? `Sync problems: ${report.errors.join("; ")}` : `Synced: ${report.items} item(s), ${report.detailsFetched} detail(s).` });
   });
 
-  r.post("/settings/canvas/delete", requireLogin, requireCsrf(services), (req, res) => {
-    services.store.deleteCanvasAccount(req.loginUserId!, String((req.body as Record<string, string>)["id"] ?? ""));
-    back(req, res, { flash: "Removed." });
+  r.post("/settings/canvas/delete", requireLogin, requireCsrf(services), async (req, res) => {
+    const r2 = await services.removeCanvasAccount(req.loginUserId!, String((req.body as Record<string, string>)["id"] ?? ""));
+    const detail = r2.removedItems ? ` ${r2.removedItems} item(s) and ${r2.blocksRemoved} planned block(s) went with it.` : "";
+    if (r2.warnings.length) back(req, res, { error: `Removed.${detail} ${r2.warnings.join(" ")}` });
+    else back(req, res, { flash: `Removed.${detail}` });
   });
 
   r.post("/settings/key", requireLogin, requireCsrf(services), (req, res) => {

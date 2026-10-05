@@ -29,10 +29,25 @@ export class GoogleError extends Error {
   constructor(
     message: string,
     public readonly status: number,
+    /** The OAuth error code from the token endpoint (`invalid_grant`, ...), when it is one we know. */
+    public readonly code?: string,
   ) {
     super(message);
     this.name = "GoogleError";
   }
+}
+
+/** Codes from RFC 6749 §5.2 that Google's token endpoint returns; nothing else from its body is kept. */
+const TOKEN_ERROR_CODES = ["invalid_request", "invalid_client", "invalid_grant", "unauthorized_client", "unsupported_grant_type", "invalid_scope"];
+
+/** The refresh token was revoked, expired or belongs to another client: only a new consent fixes it. */
+export function isInvalidGrant(e: unknown): boolean {
+  return e instanceof GoogleError && e.code === "invalid_grant";
+}
+
+/** A Google event id for a block: lowercase hex is base32hex-safe, so retries of one block collide (409) instead of duplicating. */
+export function eventIdForBlock(blockId: string): string {
+  return blockId.replaceAll("-", "").toLowerCase();
 }
 
 /** Safe to show or log: our own errors carry a status code at most; anything else (a JSON.parse message quoting the body) is replaced. */
@@ -56,15 +71,19 @@ export class GoogleCalendar {
     private readonly fetchImpl: typeof fetch = googleFetch,
   ) {}
 
-  /** `codeChallenge`: an S256 PKCE challenge; pass its verifier to `exchangeCode`. */
-  authUrl(redirectUri: string, state: string, scopes: string[] = GOOGLE_SCOPES, codeChallenge?: string): string {
+  /**
+   * `codeChallenge`: an S256 PKCE challenge; pass its verifier to `exchangeCode`.
+   * `consent: false` when a refresh token is already stored: Google then skips the
+   * consent screen for scopes already granted (and returns no new refresh token).
+   */
+  authUrl(redirectUri: string, state: string, scopes: string[] = GOOGLE_SCOPES, codeChallenge?: string, opts: { consent?: boolean } = {}): string {
     const u = new URL("https://accounts.google.com/o/oauth2/v2/auth");
     u.searchParams.set("client_id", this.clientId);
     u.searchParams.set("redirect_uri", redirectUri);
     u.searchParams.set("response_type", "code");
     u.searchParams.set("scope", scopes.join(" "));
     u.searchParams.set("access_type", "offline");
-    u.searchParams.set("prompt", "consent");
+    if (opts.consent !== false) u.searchParams.set("prompt", "consent");
     u.searchParams.set("include_granted_scopes", "true");
     u.searchParams.set("state", state);
     if (codeChallenge) {
@@ -89,7 +108,17 @@ export class GoogleCalendar {
       headers: { "content-type": "application/x-www-form-urlencoded" },
       body,
     });
-    if (!res.ok) throw new GoogleError(`google token endpoint ${res.status}`, res.status);
+    if (!res.ok) {
+      // Keep only a known error code; the rest of the body is never logged or shown.
+      let code: string | undefined;
+      try {
+        const err = (JSON.parse(await res.text()) as { error?: unknown }).error;
+        if (typeof err === "string" && TOKEN_ERROR_CODES.includes(err)) code = err;
+      } catch {
+        code = undefined;
+      }
+      throw new GoogleError(`google token endpoint ${res.status}${code ? ` (${code})` : ""}`, res.status, code);
+    }
     return (await res.json()) as GoogleTokens;
   }
 
@@ -119,8 +148,10 @@ export class GoogleCalendar {
     return out;
   }
 
-  async insertEvent(accessToken: string, calendarId: string, ev: { summary: string; description?: string; start: string; end: string; blockId: string; url?: string }): Promise<GoogleEvent> {
+  /** `id`: our own event id (see `eventIdForBlock`); Google answers 409 when it exists already. */
+  async insertEvent(accessToken: string, calendarId: string, ev: { summary: string; description?: string; start: string; end: string; blockId: string; url?: string; id?: string }): Promise<GoogleEvent> {
     return this.api<GoogleEvent>(accessToken, "POST", `/calendars/${encodeURIComponent(calendarId)}/events`, {
+      ...(ev.id ? { id: ev.id } : {}),
       summary: ev.summary,
       description: ev.description,
       start: { dateTime: ev.start },
@@ -138,6 +169,14 @@ export class GoogleCalendar {
       if (e instanceof GoogleError && (e.status === 404 || e.status === 410)) return undefined;
       throw e;
     }
+  }
+
+  /** Moves one of our events. */
+  async patchEvent(accessToken: string, calendarId: string, eventId: string, patch: { start: string; end: string }): Promise<GoogleEvent> {
+    return this.api<GoogleEvent>(accessToken, "PATCH", `/calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(eventId)}`, {
+      start: { dateTime: patch.start },
+      end: { dateTime: patch.end },
+    });
   }
 
   async deleteEvent(accessToken: string, calendarId: string, eventId: string): Promise<void> {

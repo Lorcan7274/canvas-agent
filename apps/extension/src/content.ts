@@ -1,53 +1,124 @@
 /**
- * On a Canvas page: tell the worker this origin is Canvas (so it syncs), and
- * put a "Plan my week" button on the dashboard that opens the assistant.
+ * On a Canvas page: tell the worker this origin looks like Canvas (it confirms
+ * with a JSON /api/v1/users/self before registering a new one), and put a
+ * "Plan my week" button on the dashboard that opens the assistant.
  */
-import type { Message } from "./shared.js";
+import { canvasOriginRefusal, type Message, type Reply } from "./shared.js";
 
-function isCanvas(): boolean {
-  return !!document.querySelector('meta[name="csrf-token"]') || !!document.getElementById("application") || /\/courses|\/dashboard|\/calendar/.test(location.pathname) || location.host.endsWith(".instructure.com");
+const ID = "planner-for-canvas";
+let observer: MutationObserver | undefined;
+let orphaned = false;
+
+/** Canvas's own markup on an address that may be registered; Instructure's other sites and beta/test copies never are. */
+function isCanvasPage(): boolean {
+  return canvasOriginRefusal(location.origin) === undefined && !!document.querySelector("#application.ic-app");
 }
 
-function send<T>(msg: Message): Promise<T> {
-  return new Promise((resolve) => chrome.runtime.sendMessage(msg, (r: T) => resolve(r)));
+/**
+ * A message to the worker; undefined when it cannot answer. After the
+ * extension is updated or reloaded this script is orphaned: `chrome.runtime`
+ * throws "Extension context invalidated", so the button says to reload.
+ */
+function send(msg: Message): Promise<Reply | undefined> {
+  return new Promise((resolve) => {
+    if (orphaned || !chrome.runtime?.id) {
+      resolve(orphan());
+      return;
+    }
+    try {
+      chrome.runtime.sendMessage(msg, (reply?: Reply) => {
+        // Reading lastError marks it handled (no "Unchecked runtime.lastError" in the console).
+        if (chrome.runtime.lastError) resolve(undefined);
+        else resolve(reply);
+      });
+    } catch {
+      resolve(orphan());
+    }
+  });
 }
 
-function mountButton(): void {
-  if (document.getElementById("planner-for-canvas")) return;
-  const host = document.querySelector("#dashboard_header_container, .ic-Dashboard-header__actions, #right-side, #content") as HTMLElement | null;
-  if (!host) return;
+function orphan(): undefined {
+  orphaned = true;
+  observer?.disconnect();
+  const wrap = document.getElementById(ID);
+  wrap?.querySelectorAll("button").forEach((b) => (b.disabled = true));
+  const line = wrap?.querySelector("[data-status]");
+  if (line) line.textContent = "Planner for Canvas was updated: reload this page";
+  return undefined;
+}
+
+function statusLine(reply: Reply | undefined): string {
+  if (!reply) return "";
+  if (!reply.ok) return reply.error;
+  const s = reply.status;
+  if (!s.paired) return "not paired: open the extension's options";
+  const ignored = s.ignoredOrigins[location.origin];
+  if (ignored) return `not syncing: ${ignored}`;
+  return s.lastSync[location.origin]?.message ?? "";
+}
+
+function build(): HTMLElement {
   const wrap = document.createElement("div");
-  wrap.id = "planner-for-canvas";
+  wrap.id = ID;
   wrap.style.cssText = "display:flex;gap:8px;align-items:center;margin:8px 0;font:14px system-ui,sans-serif";
-  const btn = document.createElement("button");
-  btn.textContent = "Plan my week";
-  btn.style.cssText = "padding:6px 12px;border-radius:6px;border:1px solid #1d4ed8;background:#1d4ed8;color:#fff;cursor:pointer";
-  btn.addEventListener("click", () => void send({ type: "open-assistant" }));
+  const plan = document.createElement("button");
+  plan.type = "button";
+  plan.textContent = "Plan my week";
+  plan.style.cssText = "padding:6px 12px;border-radius:6px;border:1px solid #1d4ed8;background:#1d4ed8;color:#fff;cursor:pointer";
+  plan.addEventListener("click", () => void send({ type: "open-assistant" }));
   const sync = document.createElement("button");
+  sync.type = "button";
   sync.textContent = "Sync";
   sync.style.cssText = "padding:6px 10px;border-radius:6px;border:1px solid #999;background:#fff;color:#333;cursor:pointer";
-  const status = document.createElement("span");
-  status.style.cssText = "color:#666";
+  const line = document.createElement("span");
+  line.dataset["status"] = "";
+  line.style.cssText = "color:#666";
   sync.addEventListener("click", () => {
-    status.textContent = "syncing…";
-    void send<{ lastSync?: Record<string, { ok: boolean; message: string }> }>({ type: "sync-now", origin: location.origin }).then((s) => {
-      status.textContent = s?.lastSync?.[location.origin]?.message ?? "";
+    line.textContent = "syncing…";
+    void send({ type: "sync-now" }).then((r) => {
+      if (!orphaned) line.textContent = statusLine(r);
     });
   });
-  wrap.append(btn, sync, status);
-  host.prepend(wrap);
-  void send<{ paired: boolean; lastSync?: Record<string, { ok: boolean; message: string }> }>({ type: "get-status" }).then((s) => {
-    if (!s) return;
-    status.textContent = s.paired ? s.lastSync?.[location.origin]?.message ?? "" : "not paired: open the extension options";
+  wrap.append(plan, sync, line);
+  return wrap;
+}
+
+/**
+ * Beside the dashboard header, not inside it: Canvas renders that node with
+ * React, which may replace its children at any time.
+ */
+function mount(): void {
+  if (orphaned || document.getElementById(ID)) return;
+  const header = document.querySelector("#dashboard_header_container");
+  const content = document.querySelector("#content");
+  const wrap = build();
+  if (header) header.insertAdjacentElement("afterend", wrap);
+  else if (content) content.insertAdjacentElement("afterbegin", wrap);
+  else return;
+  void send({ type: "get-status" }).then((r) => {
+    const line = wrap.querySelector("[data-status]");
+    if (line && !orphaned) line.textContent = statusLine(r);
   });
 }
 
-if (isCanvas()) {
+/** Canvas renders the dashboard late and re-renders parts of it; put the button back whenever it goes. */
+function watch(): void {
+  let queued = false;
+  observer = new MutationObserver(() => {
+    if (queued || orphaned || document.getElementById(ID)) return;
+    queued = true;
+    requestAnimationFrame(() => {
+      queued = false;
+      mount();
+    });
+  });
+  observer.observe(document.body, { childList: true, subtree: true });
+}
+
+if (isCanvasPage()) {
   void send({ type: "canvas-page", origin: location.origin });
   if (location.pathname === "/" || location.pathname.startsWith("/dashboard")) {
-    mountButton();
-    // Canvas renders the dashboard header late; try again once it settles.
-    setTimeout(mountButton, 1500);
-    setTimeout(mountButton, 4000);
+    mount();
+    watch();
   }
 }
