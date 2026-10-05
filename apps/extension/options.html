@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Planner for Canvas</title>
+<style>
+body{font:15px/1.5 system-ui,sans-serif;max-width:40rem;margin:2rem auto;padding:0 1rem;color:#1f1d1a}
+h1{font-size:1.3rem}h2{font-size:1.05rem;margin-top:1.5rem}label{display:block;font-size:.9rem;color:#666;margin-top:.5rem}
+input{width:100%;padding:.45rem .6rem;border:1px solid #ddd;border-radius:6px;font:inherit}button{margin-top:.5rem;padding:.45rem .9rem;border-radius:6px;border:1px solid #1d4ed8;background:#1d4ed8;color:#fff;font:inherit;cursor:pointer}
+button.quiet{background:#fff;color:#333;border-color:#bbb}p.out{color:#444;min-height:1.2em}ul{padding-left:1.2rem}code{font-family:ui-monospace,monospace}
+</style>
+</head>
+<body>
+<h1>Planner for Canvas</h1>
+<p>This extension reads your Canvas assignments with your own login (read-only) and sends them to your planner server. Nothing is written back to Canvas.</p>
+
+<h2>1. Pair with your planner server</h2>
+<p>On the server's settings page, generate a pairing code, then enter it here within 15 minutes. Status: <b id="paired"></b></p>
+<form id="pair-form">
+  <label>Server URL</label><input id="server" placeholder="https://planner.example.com" required>
+  <label>Pairing code</label><input id="code" placeholder="ABC123" required>
+  <button type="submit">Pair</button>
+</form>
+<p class="out" id="pair-result"></p>
+
+<h2>2. Your school's Canvas address</h2>
+<p>Instances on <code>*.instructure.com</code> work out of the box. If your school uses its own address (for example <code>canvas.school.edu</code>), add it here and allow the permission prompt.</p>
+<form id="origin-form">
+  <label>Canvas address</label><input id="origin" placeholder="canvas.school.edu">
+  <button type="submit">Add</button>
+</form>
+<p class="out" id="origin-result"></p>
+
+<h2>Status</h2>
+<ul id="origins"></ul>
+<button id="sync" class="quiet">Sync now</button>
+<button id="unpair" class="quiet">Forget everything</button>
+
+<script type="module" src="options.js"></script>
+</body>
+</html>

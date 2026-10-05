@@ -1,0 +1,23 @@
+{
+  "name": "@canvas-agent/server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/main.js",
+  "scripts": {
+    "build": "tsc -b tsconfig.json",
+    "typecheck": "tsc -b ../../packages/core && tsc -p tsconfig.json --noEmit",
+    "dev": "tsc -b ../../packages/core && tsx watch src/main.ts",
+    "start": "node dist/main.js"
+  },
+  "dependencies": {
+    "@canvas-agent/core": "workspace:*",
+    "@modelcontextprotocol/sdk": "^1.32",
+    "express": "^5.1",
+    "zod": "^3.25"
+  },
+  "devDependencies": {
+    "@types/express": "^5",
+    "@types/express-serve-static-core": "^5.1.3"
+  }
+}
