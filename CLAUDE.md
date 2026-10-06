@@ -1,6 +1,6 @@
 # canvas-agent
 
-Canvas workload, calibrated time estimates and study-block planning for AI assistants, over MCP. Read `README.md` for how it runs and `docs/DESIGN.md` for why it is shaped this way before changing structure.
+Canvas workload, calibrated time estimates and study-block planning for AI assistants, over MCP. Read `docs/DESIGN.md` for why it is shaped this way before changing structure; `.env.example` lists the configuration.
 
 ## Commands
 

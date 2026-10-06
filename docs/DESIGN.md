@@ -1,6 +1,6 @@
 # Design
 
-Why the pieces are the way they are, the constraints that shaped them, and what is still open. The README says how to run it.
+Why the pieces are the way they are, the constraints that shaped them, and what is still open.
 
 ## The idea
 
@@ -68,7 +68,7 @@ SQLite through `node:sqlite`, WAL, `synchronous=FULL`. Every table carries `user
 | Session expiry | background sync records the failure per origin, retries once a minute at most, and sets a badge that only that origin's next success clears; a sign-in page or SSO redirect reads as "not signed in"; feed keeps flowing |
 | Rate limits | planner-first, delta detail fetches, budget per sync, backoff on 429 and on Canvas's 403 "Rate Limit Exceeded"; the extension reads details four at a time and stops a sync's details when throttled |
 | New Quizzes opaque | estimated as a quiz without size; the brief's own "N minutes" is still read |
-| Instructure's API policy and school AUPs | strictly read-only, student acts with their own credential, host allowlist available for operators, README says to check the school's policy |
+| Instructure's API policy and school AUPs | strictly read-only, student acts with their own credential, host allowlist available for operators, the privacy policy says to check the school's policy |
 | ChatGPT free users only reach apps through the directory, which needs OAuth 2.1, annotations, privacy policy, a test account | the OAuth server, annotations on every tool, `get_profile`, and the stub Canvas for reviewers are in place |
 | ChatGPT calendar write is paid-only | the server writes the calendar and serves ICS |
 | Claude's client follows the 2025 authorization specs | the SDK negotiates; DCR and CIMD both work |
