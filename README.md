@@ -22,13 +22,15 @@ Canvas ──(browser extension, your session)─► ┘    │
 
 ## Quick start (for yourself)
 
-Requirements: Node 22.13 or newer (it uses the built-in `node:sqlite`), pnpm 10.
+Requirements: Node 22.13 or newer (it uses the built-in `node:sqlite`) and pnpm 10 or newer, which switches to the version pinned in `package.json` by itself. On Arch: `sudo pacman -S nodejs pnpm`.
 
 ```bash
 pnpm install
-pnpm check                 # typecheck + tests, runs against the stub Canvas
-pnpm dev                   # server on http://localhost:8787, dev login, heuristic estimates
+pnpm check
+pnpm dev
 ```
+
+`pnpm check` typechecks everything and runs the tests against the stub Canvas. `pnpm dev` starts the server on <http://localhost:8787> with dev login and heuristic estimates; leave it running.
 
 Then:
 
@@ -113,13 +115,13 @@ p80 is used automatically for anything due within 72 hours.
 
 ## Development
 
-```bash
-pnpm check                          # typecheck + vitest
-pnpm stub                           # fake Canvas on :3999 (token stub-token, feed URL printed)
-EGRESS_ALLOW_LOOPBACK=1 pnpm dev    # needed to point the server at the stub: outbound requests to loopback are refused otherwise
-pnpm dev                            # server with tsx watch
-pnpm --filter @canvas-agent/extension build   # into apps/extension/build, icons drawn by icons.mjs
-npx vitest run apps/extension               # the extension's worker against the stub and the server, through a fake `chrome`
-```
+| Command | What it does |
+|---|---|
+| `pnpm check` | Typecheck and vitest |
+| `pnpm stub` | Fake Canvas on :3999; the token is `stub-token` and the feed URL is printed |
+| `pnpm dev` | Server with `tsx watch` |
+| `EGRESS_ALLOW_LOOPBACK=1 pnpm dev` | The same, allowed to reach the stub; outbound requests to loopback are refused otherwise |
+| `pnpm --filter @canvas-agent/extension build` | Builds the extension into `apps/extension/build`, icons drawn by `icons.mjs` |
+| `npx vitest run apps/extension` | The extension's worker against the stub and the server, through a fake `chrome` |
 
 Tests run against the stub, including the full OAuth flow an assistant performs, an MCP client calling every tool, and the extension's sync (pairing, detection, batching, locks, backoff, removal). `CHANGELOG.md` lists releases. See `docs/DESIGN.md` for the reasoning behind the architecture and what is not built yet.
